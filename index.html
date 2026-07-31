@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>FlighTim</title>
+  <meta name="description" content="Suivi personnel de vos vols effectués, à partir de vos traces KML." />
+
+  <meta name="theme-color" content="#0b0f1a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="FlighTim" />
+
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="icon" href="icons/icon-192.png" />
+
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1 id="header-title">FlighTim</h1>
+  </header>
+
+  <main id="view-root" class="view-root"></main>
+
+  <nav class="tabbar" id="tabbar">
+    <button class="tab" data-route="#/flights" aria-label="Vols">
+      <span class="tab-icon">🛫</span><span class="tab-label">Vols</span>
+    </button>
+    <button class="tab" data-route="#/map" aria-label="Carte">
+      <span class="tab-icon">🗺️</span><span class="tab-label">Carte</span>
+    </button>
+    <button class="tab" data-route="#/settings" aria-label="Réglages">
+      <span class="tab-icon">⚙️</span><span class="tab-label">Réglages</span>
+    </button>
+  </nav>
+
+  <input type="file" id="folder-input" webkitdirectory multiple hidden accept=".kml" />
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
