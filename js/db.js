@@ -1,5 +1,5 @@
 const DB_NAME = 'flightim';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -11,6 +11,10 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains('meta')) {
         db.createObjectStore('meta', { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains('notionFlights')) {
+        // clé = "NUMEROVOL|YYYY-MM-DD", pour joindre avec les vols KML sans dépendre du nom de fichier
+        db.createObjectStore('notionFlights', { keyPath: 'key' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -47,6 +51,26 @@ export async function putFlights(flights) {
 
 export async function clearFlights() {
   return withStore('flights', 'readwrite', (store) => store.clear());
+}
+
+export async function getAllNotionFlights() {
+  return withStore('notionFlights', 'readonly', (store) => {
+    return new Promise((resolve, reject) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }).then((p) => p);
+}
+
+export async function putNotionFlights(records) {
+  return withStore('notionFlights', 'readwrite', (store) => {
+    for (const r of records) store.put(r);
+  });
+}
+
+export async function clearNotionFlights() {
+  return withStore('notionFlights', 'readwrite', (store) => store.clear());
 }
 
 export async function getFlightFileStamps() {

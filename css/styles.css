@@ -7,6 +7,7 @@
   --text-dim: #8b95a8;
   --accent: #4da3ff;
   --accent-2: #4ade80;
+  --warn: #f5a623;
   --danger: #f87171;
   --border: #232c40;
   --tabbar-h: 64px;
@@ -60,7 +61,21 @@ html, body {
 
 .view-root {
   min-height: calc(100vh - var(--header-h) - var(--tabbar-h) - env(safe-area-inset-top) - env(safe-area-inset-bottom));
-  padding: 12px 16px calc(24px + env(safe-area-inset-bottom));
+  /* La tabbar est en position fixed : elle ne réserve pas sa propre place,
+     donc le padding bas doit couvrir sa hauteur en plus de la marge visuelle,
+     sinon elle masque le bas du contenu scrollé. */
+  padding: 12px 16px calc(var(--tabbar-h) + 24px + env(safe-area-inset-bottom));
+}
+
+/* Page carte : plein écran entre le header et la tabbar, sans scroll de page
+   (c'est la carte elle-même qui occupe tout l'espace disponible). */
+.view-root.map-view {
+  height: calc(100vh - var(--header-h) - var(--tabbar-h) - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  min-height: 0;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .tabbar {
@@ -204,16 +219,90 @@ button.danger { color: var(--danger); }
   overflow: hidden;
   border: 1px solid var(--border);
   background: var(--bg-card);
+  flex: 1;
+  min-height: 0;
 }
 
-.detail-title { font-size: 22px; font-weight: 700; margin: 14px 0 2px; }
-.detail-sub { color: var(--text-dim); font-size: 14px; margin-bottom: 16px; }
+.map-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  padding: 2px 2px 0;
+  flex-shrink: 0;
+}
+.map-filter input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.map-filter input:disabled {
+  opacity: 0.4;
+}
+
+/* Flight hero: two endpoints (code/city/time) linked by a route indicator */
+.hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+  margin: 16px 0 0;
+}
+.hero-endpoint { flex: 1 1 0; min-width: 0; }
+.hero-endpoint.right { text-align: right; }
+.hero-code { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+.hero-city {
+  font-size: 12px; color: var(--text-dim); margin-top: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hero-time-block { margin-top: 10px; }
+.hero-time { font-size: 21px; font-weight: 700; letter-spacing: -0.01em; }
+.hero-time .day-badge { font-size: 11px; font-weight: 700; color: var(--accent); margin-left: 2px; }
+.hero-time-sched { font-size: 12px; color: var(--text-dim); text-decoration: line-through; margin-top: 1px; }
+
+.hero-middle {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 92px;
+  padding-top: 6px;
+}
+.hero-flightnum {
+  font-size: 11px; font-weight: 600; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.hero-line { display: flex; align-items: center; gap: 3px; width: 100%; margin: 8px 0; }
+.hero-line .line { flex: 1; height: 1px; background: var(--border); }
+.hero-line .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--text-dim); flex-shrink: 0; }
+.hero-line .plane { color: var(--accent); font-size: 13px; flex-shrink: 0; transform: rotate(45deg); }
+.hero-duration { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+
+.hero-date { text-align: center; font-size: 13px; color: var(--text-dim); margin-top: 12px; }
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 10px auto 0;
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  width: fit-content;
+}
+.status-pill.good { background: color-mix(in srgb, var(--accent-2) 16%, transparent); color: var(--accent-2); }
+.status-pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.status-pill.bad { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 10px;
-  margin: 16px 0;
+  margin: 20px 0 16px;
 }
 .stat-tile {
   background: var(--bg-card);
@@ -223,6 +312,9 @@ button.danger { color: var(--danger); }
 }
 .stat-tile .label { font-size: 12px; color: var(--text-dim); }
 .stat-tile .value { font-size: 19px; font-weight: 700; margin-top: 2px; }
+.stat-tile .value.good { color: var(--accent-2); }
+.stat-tile .value.warn { color: var(--warn); }
+.stat-tile .value.bad { color: var(--danger); }
 
 .info-list {
   background: var(--bg-card);
@@ -240,6 +332,15 @@ button.danger { color: var(--danger); }
 }
 .info-row:last-child { border-bottom: none; }
 .info-row .k { color: var(--text-dim); }
+
+.section-label {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin: 18px 4px 8px;
+  font-weight: 600;
+}
 
 #alt-chart {
   width: 100%;

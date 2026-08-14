@@ -30,7 +30,7 @@ function toISOFromUTCString(s) {
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-function haversineKm(lat1, lon1, lat2, lon2) {
+export function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
   const dLon = (lon2 - lon1) * Math.PI / 180;
