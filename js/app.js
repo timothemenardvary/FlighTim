@@ -745,11 +745,13 @@ function delayBarColor(min) {
 // Mini bar chart horizontal en HTML/CSS pur : une seule série par graphique
 // (pas de légende nécessaire, cf. dataviz), valeur toujours affichée en
 // clair au bout de la barre (jamais la couleur seule qui porte l'info).
+// Au-delà de `limit`, les lignes restent dans le DOM mais cachées ; un clic
+// sur "+ N autres" les déplie (cf. wireBarChartToggles, à appeler après
+// insertion dans le document).
 function barChartHtml(rows, { formatValue, colorFor, limit } = {}) {
   if (rows.length === 0) return '<p class="stats-empty">Pas assez de données.</p>';
-  const shown = limit ? rows.slice(0, limit) : rows;
-  const maxVal = Math.max(...shown.map(([, v]) => Math.abs(v)), 1);
-  const bars = shown.map(([label, value]) => {
+  const maxVal = Math.max(...rows.map(([, v]) => Math.abs(v)), 1);
+  const renderRow = ([label, value]) => {
     const pct = Math.min(100, (Math.abs(value) / maxVal) * 100);
     const color = colorFor ? colorFor(value) : 'var(--accent)';
     const valueStr = formatValue ? formatValue(value) : String(value);
@@ -759,9 +761,35 @@ function barChartHtml(rows, { formatValue, colorFor, limit } = {}) {
         <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${color};"></div></div>
         <div class="bar-value">${escapeHtml(valueStr)}</div>
       </div>`;
-  }).join('');
-  const more = rows.length > shown.length ? `<p class="stats-more">+ ${rows.length - shown.length} autre(s)</p>` : '';
-  return `<div class="bar-chart">${bars}</div>${more}`;
+  };
+
+  const truncated = limit && rows.length > limit;
+  const visible = truncated ? rows.slice(0, limit) : rows;
+  const extra = truncated ? rows.slice(limit) : [];
+  const moreLabel = `+ ${extra.length} autre${extra.length > 1 ? 's' : ''}`;
+
+  return `
+    <div class="bar-chart-wrap">
+      <div class="bar-chart">${visible.map(renderRow).join('')}</div>
+      ${truncated ? `
+        <div class="bar-chart-extra" hidden>${extra.map(renderRow).join('')}</div>
+        <button type="button" class="bar-toggle" data-more-label="${escapeHtml(moreLabel)}">${escapeHtml(moreLabel)}</button>
+      ` : ''}
+    </div>`;
+}
+
+// À appeler après avoir inséré du HTML contenant des barChartHtml() tronqués
+// (limit) : câble le clic sur "+ N autres" pour déplier/replier les lignes
+// cachées, sans avoir à re-générer le graphique.
+function wireBarChartToggles(root) {
+  root.querySelectorAll('.bar-toggle').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const extra = btn.previousElementSibling;
+      const willShow = extra.hidden;
+      extra.hidden = !willShow;
+      btn.textContent = willShow ? 'Afficher moins' : btn.dataset.moreLabel;
+    });
+  });
 }
 
 function availableStatsYears(allFlights) {
@@ -861,6 +889,7 @@ function renderFlightStats(content, flights) {
       ${barChartHtml(byRegistration, { limit: 12 })}
     </div>
   `;
+  wireBarChartToggles(content);
 }
 
 function renderAirportStats(content, flights) {
@@ -904,6 +933,7 @@ function renderAirportStats(content, flights) {
     <div id="airport-detail"></div>
     ` : ''}
   `;
+  wireBarChartToggles(content);
 
   if (selectedAirport) {
     document.getElementById('airport-select').addEventListener('change', (e) => {
@@ -949,6 +979,7 @@ function renderAirportDetail(el, { dep, arr }, code) {
       ${barChartHtml(gates)}
     </div>
   `;
+  wireBarChartToggles(el);
 }
 
 async function renderSettings() {

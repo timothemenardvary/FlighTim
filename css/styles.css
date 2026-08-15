@@ -604,12 +604,29 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
-.stats-empty, .stats-more {
+.bar-chart-extra:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+.bar-toggle {
+  display: block;
+  margin-top: 10px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0;
+}
+
+.stats-empty {
   margin: 0;
   font-size: 12px;
   color: var(--text-dim);
 }
-.stats-more { margin-top: 8px; }
 
 .airport-picker {
   display: flex;
