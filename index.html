@@ -33,13 +33,15 @@
     <button class="tab" data-route="#/map" aria-label="Carte">
       <span class="tab-icon">🗺️</span><span class="tab-label">Carte</span>
     </button>
+    <button class="tab" data-route="#/stats" aria-label="Statistiques">
+      <span class="tab-icon">📊</span><span class="tab-label">Stats</span>
+    </button>
     <button class="tab" data-route="#/settings" aria-label="Réglages">
       <span class="tab-icon">⚙️</span><span class="tab-label">Réglages</span>
     </button>
   </nav>
 
-  <input type="file" id="folder-input" webkitdirectory multiple hidden accept=".kml" />
-  <input type="file" id="notion-input" webkitdirectory multiple hidden accept=".csv" />
+  <input type="file" id="folder-input" webkitdirectory multiple hidden accept=".kml,.json,.csv" />
 
   <script src="vendor/leaflet/leaflet.js"></script>
   <script type="module" src="js/app.js"></script>

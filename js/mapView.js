@@ -64,6 +64,28 @@ export function greatCirclePoints(lat1, lon1, lat2, lon2, steps = 64) {
   return pts;
 }
 
+// Marqueur "avion" pour le replay : une flèche SVG (pas un emoji, dont
+// l'orientation par défaut varie selon les plateformes) dont on tourne
+// uniquement l'élément interne — jamais le div positionné par Leaflet
+// (qui porte déjà son propre transform: translate3d pour le placement).
+export function createPlaneMarker(map, color = '#4da3ff') {
+  const icon = L.divIcon({
+    className: 'replay-plane-icon',
+    html: `<svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 1 L19 21 L12 16.5 L5 21 Z" fill="${color}" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/></svg>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+  const marker = L.marker([0, 0], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+  return {
+    marker,
+    setPose(lat, lon, bearingDeg) {
+      marker.setLatLng([lat, lon]);
+      const svg = marker.getElement()?.querySelector('svg');
+      if (svg) svg.style.transform = `rotate(${bearingDeg}deg)`;
+    },
+  };
+}
+
 export function drawGreatCircle(map, lat1, lon1, lat2, lon2, color = '#4da3ff', opts = {}) {
   const latlngs = greatCirclePoints(lat1, lon1, lat2, lon2);
   return L.polyline(latlngs, {

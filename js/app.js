@@ -1,22 +1,32 @@
 import { parseKML, haversineKm } from './kmlParser.js';
+import { parseFlightAwareJSON } from './flightAwareParser.js';
 import { parseNotionCSV } from './notionParser.js';
 import * as db from './db.js';
-import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot } from './mapView.js';
+import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot, createPlaneMarker } from './mapView.js';
 import { lookupAirport } from './airports.js';
+import { createFlightReplay } from './replay.js';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
 const folderInput = document.getElementById('folder-input');
-const notionInput = document.getElementById('notion-input');
 const tabButtons = [...document.querySelectorAll('.tab')];
 
 let flights = []; // in-memory cache of vols KML, triés desc par date
 let notionByKey = new Map(); // "NUMEROVOL|YYYY-MM-DD" -> ligne Notion, pour enrichir le détail d'un vol
 let mapInstance = null; // tracked so we can .remove() before re-rendering a view with a map
 let showOrthodromicOnly = true; // carte "Toutes les traces" : inclure les vols sans trace GPS réelle
+let currentReplay = null; // replay en cours sur la page détail, à stopper avant de quitter la vue
+let pendingRefresh = false; // le prochain choix de dossier doit d'abord tout effacer (bouton "Rafraîchir")
+let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
+let statsYear = 'all'; // filtre année partagé par les deux sous-vues de la page Stats
+let selectedAirport = null; // aéroport choisi dans le détail de la page Stats > Aéroports
 
 function notionKeyFor(flight) {
   return `${(flight.flightNumber || '').toUpperCase()}|${flight.date || ''}`;
+}
+
+function nFor(flight) {
+  return notionByKey.get(notionKeyFor(flight));
 }
 
 function resolveAirport(code) {
@@ -76,6 +86,10 @@ function buildDisplayFlights() {
 }
 
 function destroyMap() {
+  if (currentReplay) {
+    currentReplay.destroy();
+    currentReplay = null;
+  }
   if (mapInstance) {
     mapInstance.remove();
     mapInstance = null;
@@ -170,6 +184,117 @@ function infoRow(label, value) {
   return `<div class="info-row"><span class="k">${escapeHtml(label)}</span><span>${escapeHtml(value)}</span></div>`;
 }
 
+function delayMinutes(schedTs, actualTs) {
+  return (schedTs != null && actualTs != null) ? (actualTs - schedTs) / 60000 : null;
+}
+
+// Horaires "porte" + décollage/atterrissage d'un vol, toutes sources
+// confondues : Notion (STD/ATD, STA/ATA) prime quand il existe (donnée de
+// référence saisie par l'utilisateur), sinon on retombe sur ceux du KML/JSON
+// importé. Partagé entre le détail de vol et les pages de statistiques.
+//
+// Piège corrigé ici : Notion encode l'heure locale "comme si" c'était de
+// l'UTC (cf. notionParser, pour que fmtHM() — qui lit toujours les
+// composants UTC d'un timestamp — restitue l'heure locale telle quelle).
+// FlightAware, lui, fournit de vrais epochs UTC. Sans conversion, fmtHM()
+// afficherait donc l'heure de Paris en Zulu pour les vols FlightAware sans
+// correspondance Notion (et systématiquement pour décollage/atterrissage,
+// que Notion n'a jamais) — d'où le décalage à l'affichage. On ramène tout à
+// la même convention "heure locale encodée en UTC" avant de renvoyer quoi
+// que ce soit.
+function flightGateTimes(f) {
+  const n = nFor(f);
+  const depOffsetMin = airportUtcOffsetMin(f.depTz, n?.depUtcOffsetMin, f.depGateActualAt, f.depGateSchedAt, f.depTakeoffActualAt, f.depTakeoffSchedAt);
+  const arrOffsetMin = airportUtcOffsetMin(f.arrTz, n?.arrUtcOffsetMin, f.arrGateActualAt, f.arrGateSchedAt, f.arrLandingActualAt, f.arrLandingSchedAt);
+  return {
+    n,
+    depOffsetMin,
+    arrOffsetMin,
+    depGateSched: n?.stdAt ?? toLocalNaive(f.depGateSchedAt, depOffsetMin),
+    depGateActual: n?.atdAt ?? toLocalNaive(f.depGateActualAt, depOffsetMin),
+    arrGateSched: n?.staAt ?? toLocalNaive(f.arrGateSchedAt, arrOffsetMin),
+    arrGateActual: n?.ataAt ?? toLocalNaive(f.arrGateActualAt, arrOffsetMin),
+    depTakeoffSched: toLocalNaive(f.depTakeoffSchedAt, depOffsetMin),
+    depTakeoffActual: toLocalNaive(f.depTakeoffActualAt, depOffsetMin),
+    arrLandingSched: toLocalNaive(f.arrLandingSchedAt, arrOffsetMin),
+    arrLandingActual: toLocalNaive(f.arrLandingActualAt, arrOffsetMin),
+  };
+}
+
+function flightDelays(f) {
+  const { depGateSched, depGateActual, arrGateSched, arrGateActual } = flightGateTimes(f);
+  return {
+    depDelayMin: delayMinutes(depGateSched, depGateActual),
+    arrDelayMin: delayMinutes(arrGateSched, arrGateActual),
+  };
+}
+
+// Décalage UTC réel (en minutes) d'un fuseau IANA à un instant donné, DST
+// pris en compte : on formate l'instant dans ce fuseau, on relit les
+// composants "comme si" c'était de l'UTC, et on mesure l'écart avec le vrai
+// instant UTC. Ne nécessite aucune base de données de fuseaux embarquée.
+function tzOffsetMinutes(epochMs, timeZone) {
+  try {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    const p = Object.fromEntries(dtf.formatToParts(new Date(epochMs)).map((x) => [x.type, x.value]));
+    const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+    return Math.round((asUTC - epochMs) / 60000);
+  } catch {
+    return null;
+  }
+}
+
+function fmtUtcOffset(mins) {
+  if (mins == null) return null;
+  const sign = mins < 0 ? '−' : '+';
+  const abs = Math.abs(mins);
+  const h = Math.floor(abs / 60), m = abs % 60;
+  return `UTC${sign}${h}${m ? ':' + String(m).padStart(2, '0') : ''}`;
+}
+
+// Décalage d'un aéroport : calculé depuis son fuseau IANA (FlightAware,
+// précis et sensible au DST) si dispo, sinon replié sur le "(GMT+X)" que
+// Notion affiche déjà pré-calculé pour cette date-là.
+function airportUtcOffsetMin(tz, notionOffsetMin, ...refEpochs) {
+  if (tz) {
+    const ref = refEpochs.find((e) => e != null);
+    if (ref != null) {
+      const computed = tzOffsetMinutes(ref, tz);
+      if (computed != null) return computed;
+    }
+  }
+  return notionOffsetMin ?? null;
+}
+
+// Décale un vrai epoch UTC (FlightAware) pour qu'il se lise, une fois passé
+// à fmtHM() (qui lit les composants UTC), comme l'heure locale de
+// l'aéroport — même convention que les timestamps Notion. `offsetMin` doit
+// avoir été calculé sur un epoch UTC non converti (cf. airportUtcOffsetMin),
+// jamais sur une valeur déjà décalée par cette fonction.
+function toLocalNaive(trueUtcMs, offsetMin) {
+  if (trueUtcMs == null || offsetMin == null) return trueUtcMs;
+  return trueUtcMs + offsetMin * 60000;
+}
+
+// Ligne "programmé → réel" avec code couleur de retard et badge UTC — pour
+// les sections Départ/Arrivée du détail de vol.
+function phaseTimeRow(label, schedTs, actualTs, offsetMin) {
+  if (schedTs == null && actualTs == null) return '';
+  const schedStr = schedTs != null ? fmtHM(schedTs) : null;
+  const actualStr = actualTs != null ? fmtHM(actualTs) : null;
+  const info = delayInfo(delayMinutes(schedTs, actualTs));
+  let valueHtml = (schedStr && actualStr && schedStr !== actualStr)
+    ? `<span class="time-sched-inline">${schedStr}</span> → <span class="${info ? info.cls : ''}">${actualStr}</span>`
+    : (actualStr || schedStr);
+  const offsetLabel = fmtUtcOffset(offsetMin);
+  if (offsetLabel) valueHtml += ` <span class="utc-badge">${offsetLabel}</span>`;
+  return `<div class="info-row"><span class="k">${escapeHtml(label)}</span><span>${valueHtml}</span></div>`;
+}
+
 // ---------- Router ----------
 
 function currentRoute() {
@@ -203,6 +328,8 @@ function render() {
     renderFlightDetail(id);
   } else if (route === '#/map') {
     renderAllMap();
+  } else if (route === '#/stats') {
+    renderStats();
   } else if (route === '#/settings') {
     renderSettings();
   } else {
@@ -221,7 +348,7 @@ function renderFlightsList() {
       <div class="empty-state">
         <span class="big-emoji">✈️</span>
         <div>Aucun vol importé pour l'instant.</div>
-        <button class="primary" id="import-empty-btn">Importer le dossier KML</button>
+        <button class="primary" id="import-empty-btn">Importer mes données</button>
       </div>`;
     document.getElementById('import-empty-btn').addEventListener('click', () => folderInput.click());
     return;
@@ -256,7 +383,11 @@ function renderFlightsList() {
   });
 }
 
-function drawAltitudeChart(canvas, points) {
+// Prépare le canvas une seule fois (taille, échelle DPR) et renvoie une
+// fonction draw(progress) redessinable à chaque frame du replay — pas de
+// redimensionnement du canvas à chaque appel, juste un clear + retracé, pour
+// rester fluide à 60 fps.
+function setupAltitudeChart(canvas, points) {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   canvas.width = rect.width * dpr;
@@ -266,24 +397,47 @@ function drawAltitudeChart(canvas, points) {
   const w = rect.width, h = rect.height;
   const alts = points.map((p) => p.alt ?? 0);
   const maxA = Math.max(...alts, 1);
-  ctx.clearRect(0, 0, w, h);
-  ctx.beginPath();
-  alts.forEach((a, i) => {
-    const x = (i / (alts.length - 1 || 1)) * w;
-    const y = h - (a / maxA) * (h - 8) - 4;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, 'rgba(77,163,255,0.9)');
-  grad.addColorStop(1, 'rgba(77,163,255,0.9)');
-  ctx.strokeStyle = grad;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  ctx.lineTo(w, h);
-  ctx.lineTo(0, h);
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(77,163,255,0.12)';
-  ctx.fill();
+  const yFor = (a) => h - (a / maxA) * (h - 8) - 4;
+
+  return function draw(progress = null) {
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    alts.forEach((a, i) => {
+      const x = (i / (alts.length - 1 || 1)) * w;
+      const y = yFor(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, 'rgba(77,163,255,0.9)');
+    grad.addColorStop(1, 'rgba(77,163,255,0.9)');
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.lineTo(w, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(77,163,255,0.12)';
+    ctx.fill();
+
+    if (progress == null) return;
+    const idxF = progress * (alts.length - 1);
+    const i0 = Math.floor(idxF), i1 = Math.min(i0 + 1, alts.length - 1);
+    const a = alts[i0] + (alts[i1] - alts[i0]) * (idxF - i0);
+    const x = progress * w, y = yFor(a);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.strokeStyle = 'rgba(148,163,184,0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#4da3ff';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.stroke();
+  };
 }
 
 function renderFlightDetail(id) {
@@ -297,24 +451,20 @@ function renderFlightDetail(id) {
   }
 
   const duration = fmtDuration(f.startTime, f.endTime);
-  const n = notionByKey.get(notionKeyFor(f));
+  const {
+    n, depOffsetMin, arrOffsetMin,
+    depGateSched, depGateActual, arrGateSched, arrGateActual,
+    depTakeoffSched, depTakeoffActual, arrLandingSched, arrLandingActual,
+  } = flightGateTimes(f);
+  const hasGateTimes = depGateActual != null || arrGateActual != null;
 
-  // Heure "actual" affichée en priorité (ATD/ATA), avec repli sur la
-  // programmée (STD/STA) si le vol n'a pas encore d'heure réelle, puis sur
-  // les horaires KML (déjà en UTC réel) si aucune donnée Notion n'existe.
-  const depSched = n?.stdAt ?? null;
-  const depActual = n?.atdAt ?? n?.stdAt ?? null;
-  const arrSched = n?.staAt ?? null;
-  const arrActual = n?.ataAt ?? n?.staAt ?? null;
-  const hasNotionTimes = depActual != null || arrActual != null;
-
-  const depDelayMin = (n?.atdAt != null && n?.stdAt != null) ? (n.atdAt - n.stdAt) / 60000 : null;
-  const arrDelayMin = (n?.ataAt != null && n?.staAt != null) ? (n.ataAt - n.staAt) / 60000 : null;
+  const depDelayMin = delayMinutes(depGateSched, depGateActual);
+  const arrDelayMin = delayMinutes(arrGateSched, arrGateActual);
   const primaryDelay = arrDelayMin != null
     ? delayInfo(arrDelayMin, { arrival: true })
     : (depDelayMin != null ? delayInfo(depDelayMin, { arrival: false }) : null);
 
-  const arrDayOffset = dayOffset(depActual ?? depSched, arrActual ?? arrSched);
+  const arrDayOffset = dayOffset(depGateActual ?? depGateSched, arrGateActual ?? arrGateSched);
   const avgSpeedKmh = (f.distanceKm && f.startTime && f.endTime)
     ? Math.round(f.distanceKm / ((new Date(f.endTime) - new Date(f.startTime)) / 3600000))
     : null;
@@ -322,25 +472,58 @@ function renderFlightDetail(id) {
   const depDelayInfo = delayInfo(depDelayMin, { arrival: false });
   const arrDelayInfo = delayInfo(arrDelayMin, { arrival: true });
 
+  const depRows = [
+    phaseTimeRow('Heure (porte)', depGateSched, depGateActual, depOffsetMin),
+    phaseTimeRow('Décollage', depTakeoffSched, depTakeoffActual, depOffsetMin),
+    infoRow('Porte', f.depGate || n?.depGate),
+    infoRow('Terminal', f.depTerminal),
+    infoRow('Piste', f.depRunway || n?.depRunway),
+    infoRow('Embarquement', (n?.boardingStartAt || n?.boardingEndAt) ? `${n.boardingStartAt ? fmtHM(n.boardingStartAt) : '—'} → ${n.boardingEndAt ? fmtHM(n.boardingEndAt) : '—'}` : null),
+    infoRow('Taxi avant décollage', n?.departureTaxiTime ? n.departureTaxiTime + ' min' : null),
+  ].join('');
+
+  const arrRows = [
+    phaseTimeRow('Heure (porte)', arrGateSched, arrGateActual, arrOffsetMin),
+    phaseTimeRow('Atterrissage', arrLandingSched, arrLandingActual, arrOffsetMin),
+    infoRow('Porte', f.arrGate || n?.arrGate),
+    infoRow('Terminal', f.arrTerminal),
+    infoRow('Piste', f.arrRunway || n?.arrRunway),
+  ].join('');
+
+  // Carburant planifié (dispatch) -> CO2 estimé : ~3,16 kg de CO2 par kg de
+  // kérosène brûlé (facteur d'émission standard pour le Jet A-1).
+  const co2Tonnes = f.fuelBurnLbs != null ? (f.fuelBurnLbs * 0.453592 * 3.16) / 1000 : null;
+
   const hasRealTrack = !!(f.points && f.points.length >= 2);
   const depCoord = f.depCoord ?? null; // vols virtuels (Notion-only) uniquement
   const arrCoord = f.arrCoord ?? null;
   const canShowMap = hasRealTrack || (depCoord && arrCoord);
 
-  const heroTimes = hasNotionTimes ? `
+  const heroTimes = hasGateTimes ? `
     <div class="hero-time-block">
-      <div class="hero-time">${fmtHM(depActual) ?? '—'}</div>
-      ${(depSched != null && depSched !== depActual) ? `<div class="hero-time-sched">${fmtHM(depSched)}</div>` : ''}
+      <div class="hero-time">${fmtHM(depGateActual) ?? '—'}</div>
+      ${(depGateSched != null && depGateSched !== depGateActual) ? `<div class="hero-time-sched">${fmtHM(depGateSched)}</div>` : ''}
     </div>` : '';
-  const heroTimesArr = hasNotionTimes ? `
+  const heroTimesArr = hasGateTimes ? `
     <div class="hero-time-block">
-      <div class="hero-time">${fmtHM(arrActual) ?? '—'}${arrDayOffset > 0 ? `<sup class="day-badge">+${arrDayOffset}</sup>` : ''}</div>
-      ${(arrSched != null && arrSched !== arrActual) ? `<div class="hero-time-sched">${fmtHM(arrSched)}</div>` : ''}
+      <div class="hero-time">${fmtHM(arrGateActual) ?? '—'}${arrDayOffset > 0 ? `<sup class="day-badge">+${arrDayOffset}</sup>` : ''}</div>
+      ${(arrGateSched != null && arrGateSched !== arrGateActual) ? `<div class="hero-time-sched">${fmtHM(arrGateSched)}</div>` : ''}
     </div>` : '';
 
   viewRoot.innerHTML = `
     <button class="back-btn" id="back-btn">&#8249; Vols</button>
     ${canShowMap ? '<div id="flight-map"></div>' : ''}
+    ${hasRealTrack ? `
+    <div class="replay-bar">
+      <button class="replay-play" id="replay-play" aria-label="Lecture">&#9654;</button>
+      <input type="range" id="replay-seek" min="0" max="1000" value="0" step="1" />
+      <span class="replay-time" id="replay-time">--:--</span>
+      <div class="replay-speeds" id="replay-speeds">
+        <button type="button" data-speed="60">1 min/s</button>
+        <button type="button" data-speed="300" class="active">5 min/s</button>
+        <button type="button" data-speed="900">15 min/s</button>
+      </div>
+    </div>` : ''}
 
     <div class="hero">
       <div class="hero-endpoint">
@@ -362,6 +545,33 @@ function renderFlightDetail(id) {
     <div class="hero-date">${fmtDate(f.date)}</div>
     ${primaryDelay ? `<div class="status-pill ${primaryDelay.cls}">${primaryDelay.label}</div>` : ''}
 
+    ${depRows ? `
+    <div class="leg-card leg-dep">
+      <div class="leg-header">
+        <span class="leg-icon">&#128747;</span>
+        <span class="leg-title">Départ</span>
+        <span class="leg-airport">${escapeHtml(f.depIata || '???')}${f.depName ? ' · ' + escapeHtml(f.depName) : ''}</span>
+      </div>
+      <div class="info-list">${depRows}</div>
+    </div>` : ''}
+
+    ${arrRows ? `
+    <div class="leg-card leg-arr">
+      <div class="leg-header">
+        <span class="leg-icon">&#128748;</span>
+        <span class="leg-title">Arrivée</span>
+        <span class="leg-airport">${escapeHtml(f.arrIata || '???')}${f.arrName ? ' · ' + escapeHtml(f.arrName) : ''}</span>
+      </div>
+      <div class="info-list">${arrRows}</div>
+    </div>` : ''}
+
+    ${f.photoUrl ? `
+    <div class="aircraft-photo" id="aircraft-photo-wrap">
+      <img id="aircraft-photo-img" alt="Photo de l'appareil" loading="lazy" />
+      <div class="aircraft-photo-fallback" id="aircraft-photo-fallback">Photo indisponible hors ligne</div>
+      <span class="aircraft-photo-credit">Photo : FlightAware</span>
+    </div>` : ''}
+
     <div class="stat-grid">
       <div class="stat-tile"><div class="label">Retard départ</div><div class="value${depDelayInfo ? ' ' + depDelayInfo.cls : ''}">${fmtSignedDelay(depDelayMin) ?? '—'}</div></div>
       <div class="stat-tile"><div class="label">Retard arrivée</div><div class="value${arrDelayInfo ? ' ' + arrDelayInfo.cls : ''}">${fmtSignedDelay(arrDelayMin) ?? '—'}</div></div>
@@ -369,6 +579,8 @@ function renderFlightDetail(id) {
       <div class="stat-tile"><div class="label">Distance${f.isVirtual ? ' (approx.)' : ''}</div><div class="value">${f.distanceKm ? f.distanceKm + ' km' : '—'}</div></div>
       <div class="stat-tile"><div class="label">Vitesse moyenne</div><div class="value">${avgSpeedKmh ? avgSpeedKmh + ' km/h' : '—'}</div></div>
       <div class="stat-tile"><div class="label">Altitude max</div><div class="value">${f.maxAltitude ? f.maxAltitude.toLocaleString('fr-FR') + ' ft' : '—'}</div></div>
+      ${f.fuelBurnGallons != null ? `<div class="stat-tile"><div class="label">Carburant (plan de vol)</div><div class="value">${f.fuelBurnGallons.toLocaleString('fr-FR')} gal</div></div>` : ''}
+      ${co2Tonnes != null ? `<div class="stat-tile"><div class="label">CO&#8322; estimé</div><div class="value">${co2Tonnes.toLocaleString('fr-FR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} t</div></div>` : ''}
     </div>
 
     ${(f.points && f.points.length >= 2) ? '<canvas id="alt-chart"></canvas>' : ''}
@@ -377,33 +589,61 @@ function renderFlightDetail(id) {
       ${infoRow('Appareil', f.aircraftType)}
       ${infoRow('Immatriculation', f.registration || n?.registration)}
       ${infoRow('Indicatif', f.callsign)}
+      ${infoRow('Cabine', n?.cabin)}
+      ${infoRow('Siège', n?.seats && n?.seatType ? `${n.seats} · ${n.seatType}` : (n?.seats || n?.seatType))}
+      ${infoRow('Bloc prévu / réel', (n?.scheduledBlockTime || n?.actualBlockTime) ? `${n.scheduledBlockTime || '—'} / ${n.actualBlockTime || '—'}` : null)}
       ${infoRow('Vitesse max', f.maxSpeed ? f.maxSpeed + ' kt' : null)}
       ${infoRow('Fichier source', f.sourceFile)}
     </div>
-
-    ${n ? `
-      <div class="section-label">Notion</div>
-      <div class="info-list">
-        ${infoRow('Cabine', n.cabin)}
-        ${infoRow('Siège', n.seats && n.seatType ? `${n.seats} · ${n.seatType}` : (n.seats || n.seatType))}
-        ${infoRow('Portes dép. / arr.', (n.depGate || n.arrGate) ? `${n.depGate || '—'} → ${n.arrGate || '—'}` : null)}
-        ${infoRow('Pistes dép. / arr.', (n.depRunway || n.arrRunway) ? `${n.depRunway || '—'} → ${n.arrRunway || '—'}` : null)}
-        ${infoRow('Embarquement', (n.boardingStartAt || n.boardingEndAt) ? `${n.boardingStartAt ? fmtHM(n.boardingStartAt) : '—'} → ${n.boardingEndAt ? fmtHM(n.boardingEndAt) : '—'}` : null)}
-        ${infoRow('Bloc prévu / réel', (n.scheduledBlockTime || n.actualBlockTime) ? `${n.scheduledBlockTime || '—'} / ${n.actualBlockTime || '—'}` : null)}
-        ${infoRow('Taxi départ', n.departureTaxiTime ? n.departureTaxiTime + ' min' : null)}
-      </div>
-    ` : ''}
   `;
 
   document.getElementById('back-btn').addEventListener('click', () => navigate('#/flights'));
+
+  if (f.photoUrl) {
+    const img = document.getElementById('aircraft-photo-img');
+    // Écouteur posé avant d'assigner src : si le chargement échoue (hors
+    // ligne, lien mort...) on bascule sur le texte de repli plutôt que de
+    // laisser une icône d'image cassée.
+    img.addEventListener('error', () => {
+      document.getElementById('aircraft-photo-wrap')?.classList.add('is-fallback');
+    });
+    img.src = f.photoUrl;
+  }
 
   if (hasRealTrack) {
     mapInstance = createMap('flight-map');
     const line = drawFlightPath(mapInstance, f);
     fitToLayers(mapInstance, [line]);
-    if (f.points.some((p) => p.alt != null)) {
-      drawAltitudeChart(document.getElementById('alt-chart'), f.points);
-    }
+
+    const drawAlt = f.points.some((p) => p.alt != null)
+      ? setupAltitudeChart(document.getElementById('alt-chart'), f.points)
+      : null;
+
+    const planeMarker = createPlaneMarker(mapInstance);
+    const playBtn = document.getElementById('replay-play');
+    const seekEl = document.getElementById('replay-seek');
+    const timeEl = document.getElementById('replay-time');
+    const speedBtns = [...document.querySelectorAll('#replay-speeds button')];
+
+    currentReplay = createFlightReplay(f.points, {
+      speed: 300,
+      onFrame: (pose, { playing }) => {
+        planeMarker.setPose(pose.lat, pose.lon, pose.bearingDeg);
+        if (drawAlt) drawAlt(pose.progress);
+        seekEl.value = String(Math.round(pose.progress * 1000));
+        playBtn.innerHTML = playing ? '&#10074;&#10074;' : '&#9654;';
+        timeEl.textContent = pose.tMs != null ? fmtHM(pose.tMs) : `${Math.round(pose.progress * 100)}%`;
+      },
+    });
+
+    playBtn.addEventListener('click', () => currentReplay.toggle());
+    seekEl.addEventListener('input', () => currentReplay.seek(Number(seekEl.value) / 1000));
+    speedBtns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        speedBtns.forEach((b) => b.classList.toggle('active', b === btn));
+        currentReplay.setSpeed(Number(btn.dataset.speed));
+      });
+    });
   } else if (canShowMap) {
     mapInstance = createMap('flight-map');
     const line = drawGreatCircle(mapInstance, depCoord[0], depCoord[1], arrCoord[0], arrCoord[1]);
@@ -459,38 +699,283 @@ function renderAllMap() {
   else mapInstance.setView([20, 0], 2);
 }
 
+// ---------- Statistiques ----------
+
+// Regroupe et compte les occurrences par clé (triées desc). `includeUnknown`
+// contrôle si les vols sans valeur pour cette clé rejoignent un panier
+// "Inconnu(e)" (utile pour voir la complétude des données, ex: compagnies)
+// ou sont simplement ignorés (utile pour des stats "réelles", ex: pistes).
+function countBy(items, keyFn, { includeUnknown = true } = {}) {
+  const map = new Map();
+  for (const item of items) {
+    const raw = keyFn(item);
+    if (!raw) {
+      if (!includeUnknown) continue;
+      map.set('Inconnu(e)', (map.get('Inconnu(e)') || 0) + 1);
+      continue;
+    }
+    map.set(raw, (map.get(raw) || 0) + 1);
+  }
+  return [...map.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function avgByGroup(items, keyFn, valueFn) {
+  const sums = new Map();
+  for (const item of items) {
+    const key = keyFn(item) || 'Inconnu(e)';
+    const v = valueFn(item);
+    if (v == null) continue;
+    const cur = sums.get(key) || { sum: 0, n: 0 };
+    cur.sum += v;
+    cur.n += 1;
+    sums.set(key, cur);
+  }
+  return [...sums.entries()].map(([k, { sum, n }]) => [k, sum / n]).sort((a, b) => b[1] - a[1]);
+}
+
+// Couleur de statut (bonne/moyenne/mauvaise) reprise du vocabulaire retard
+// déjà utilisé partout ailleurs dans l'app — jamais une teinte catégorielle
+// arbitraire, toujours la même sémantique good/warn/bad.
+function delayBarColor(min) {
+  const info = delayInfo(min);
+  if (!info) return 'var(--accent)';
+  return info.cls === 'good' ? 'var(--accent-2)' : info.cls === 'warn' ? 'var(--warn)' : 'var(--danger)';
+}
+
+// Mini bar chart horizontal en HTML/CSS pur : une seule série par graphique
+// (pas de légende nécessaire, cf. dataviz), valeur toujours affichée en
+// clair au bout de la barre (jamais la couleur seule qui porte l'info).
+function barChartHtml(rows, { formatValue, colorFor, limit } = {}) {
+  if (rows.length === 0) return '<p class="stats-empty">Pas assez de données.</p>';
+  const shown = limit ? rows.slice(0, limit) : rows;
+  const maxVal = Math.max(...shown.map(([, v]) => Math.abs(v)), 1);
+  const bars = shown.map(([label, value]) => {
+    const pct = Math.min(100, (Math.abs(value) / maxVal) * 100);
+    const color = colorFor ? colorFor(value) : 'var(--accent)';
+    const valueStr = formatValue ? formatValue(value) : String(value);
+    return `
+      <div class="bar-row">
+        <div class="bar-label">${escapeHtml(label)}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${color};"></div></div>
+        <div class="bar-value">${escapeHtml(valueStr)}</div>
+      </div>`;
+  }).join('');
+  const more = rows.length > shown.length ? `<p class="stats-more">+ ${rows.length - shown.length} autre(s)</p>` : '';
+  return `<div class="bar-chart">${bars}</div>${more}`;
+}
+
+function availableStatsYears(allFlights) {
+  const years = new Set();
+  for (const f of allFlights) {
+    if (f.date) years.add(f.date.slice(0, 4));
+  }
+  return [...years].sort().reverse();
+}
+
+function fmtTotalHours(totalMin) {
+  if (!totalMin) return '—';
+  const h = Math.floor(totalMin / 60);
+  const m = Math.round(totalMin % 60);
+  return `${h.toLocaleString('fr-FR')} h ${String(m).padStart(2, '0')}`;
+}
+
+function renderStats() {
+  headerTitle.textContent = 'Statistiques';
+  const allFlights = buildDisplayFlights();
+  const years = availableStatsYears(allFlights);
+  const flights = statsYear === 'all' ? allFlights : allFlights.filter((f) => f.date && f.date.startsWith(statsYear));
+
+  viewRoot.innerHTML = `
+    <div class="stats-filters">
+      <div class="segmented" id="stats-tabs">
+        <button type="button" data-view="flights" class="${statsSubView === 'flights' ? 'active' : ''}">Vols</button>
+        <button type="button" data-view="airports" class="${statsSubView === 'airports' ? 'active' : ''}">Aéroports</button>
+      </div>
+      <select id="stats-year">
+        <option value="all" ${statsYear === 'all' ? 'selected' : ''}>Toutes les années</option>
+        ${years.map((y) => `<option value="${y}" ${statsYear === y ? 'selected' : ''}>${y}</option>`).join('')}
+      </select>
+    </div>
+    <div id="stats-content"></div>
+  `;
+
+  document.getElementById('stats-tabs').querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (statsSubView === btn.dataset.view) return;
+      statsSubView = btn.dataset.view;
+      renderStats();
+    });
+  });
+  document.getElementById('stats-year').addEventListener('change', (e) => {
+    statsYear = e.target.value;
+    renderStats();
+  });
+
+  const content = document.getElementById('stats-content');
+  if (flights.length === 0) {
+    content.innerHTML = `<div class="empty-state"><span class="big-emoji">📊</span><div>Aucun vol pour cette période.</div></div>`;
+    return;
+  }
+  if (statsSubView === 'airports') renderAirportStats(content, flights);
+  else renderFlightStats(content, flights);
+}
+
+function renderFlightStats(content, flights) {
+  const totalMin = flights.reduce((sum, f) => {
+    if (!f.startTime || !f.endTime) return sum;
+    const ms = new Date(f.endTime) - new Date(f.startTime);
+    return isFinite(ms) && ms > 0 ? sum + ms / 60000 : sum;
+  }, 0);
+
+  const byAirline = countBy(flights, (f) => f.airline);
+  const delayByAirline = avgByGroup(flights, (f) => f.airline, (f) => {
+    const { depDelayMin, arrDelayMin } = flightDelays(f);
+    return arrDelayMin ?? depDelayMin;
+  });
+  const byAircraftType = countBy(flights, (f) => f.aircraftType);
+  const byRegistration = countBy(flights, (f) => f.registration || nFor(f)?.registration);
+
+  content.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="label">Vols</div><div class="value">${flights.length}</div></div>
+      <div class="stat-tile"><div class="label">Temps de vol total</div><div class="value">${fmtTotalHours(totalMin)}</div></div>
+    </div>
+
+    <div class="chart-card">
+      <h3>Retard moyen (arrivée) par compagnie</h3>
+      ${barChartHtml(delayByAirline, { formatValue: fmtSignedDelay, colorFor: delayBarColor })}
+    </div>
+
+    <div class="chart-card">
+      <h3>Vols par compagnie</h3>
+      ${barChartHtml(byAirline)}
+    </div>
+
+    <div class="chart-card">
+      <h3>Vols par type d'avion</h3>
+      ${barChartHtml(byAircraftType)}
+    </div>
+
+    <div class="chart-card">
+      <h3>Vols par immatriculation</h3>
+      ${barChartHtml(byRegistration, { limit: 12 })}
+    </div>
+  `;
+}
+
+function renderAirportStats(content, flights) {
+  const idx = new Map(); // code -> { dep: [flights...], arr: [flights...] }
+  for (const f of flights) {
+    if (f.depIata) {
+      if (!idx.has(f.depIata)) idx.set(f.depIata, { dep: [], arr: [] });
+      idx.get(f.depIata).dep.push(f);
+    }
+    if (f.arrIata) {
+      if (!idx.has(f.arrIata)) idx.set(f.arrIata, { dep: [], arr: [] });
+      idx.get(f.arrIata).arr.push(f);
+    }
+  }
+
+  const totals = [...idx.entries()]
+    .map(([code, { dep, arr }]) => [code, dep.length + arr.length])
+    .sort((a, b) => b[1] - a[1]);
+
+  if (!selectedAirport || !idx.has(selectedAirport)) {
+    selectedAirport = totals.length ? totals[0][0] : null;
+  }
+
+  const airportOptions = totals.map(([code]) => {
+    const a = resolveAirport(code);
+    const label = a ? `${code} · ${a.city}` : code;
+    return `<option value="${escapeHtml(code)}" ${code === selectedAirport ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+
+  content.innerHTML = `
+    <div class="chart-card">
+      <h3>Vols par aéroport</h3>
+      ${barChartHtml(totals, { limit: 15 })}
+    </div>
+
+    ${selectedAirport ? `
+    <div class="airport-picker">
+      <label class="k" for="airport-select">Détail par aéroport</label>
+      <select id="airport-select">${airportOptions}</select>
+    </div>
+    <div id="airport-detail"></div>
+    ` : ''}
+  `;
+
+  if (selectedAirport) {
+    document.getElementById('airport-select').addEventListener('change', (e) => {
+      selectedAirport = e.target.value;
+      renderAirportStats(content, flights);
+    });
+    renderAirportDetail(document.getElementById('airport-detail'), idx.get(selectedAirport), selectedAirport);
+  }
+}
+
+function renderAirportDetail(el, { dep, arr }, code) {
+  const a = resolveAirport(code);
+  const runwayDep = countBy(dep, (f) => f.depRunway || nFor(f)?.depRunway, { includeUnknown: false });
+  const runwayArr = countBy(arr, (f) => f.arrRunway || nFor(f)?.arrRunway, { includeUnknown: false });
+  const gates = countBy(dep, (f) => f.depGate || nFor(f)?.depGate, { includeUnknown: false });
+
+  const taxiValues = dep
+    .map((f) => Number(nFor(f)?.departureTaxiTime))
+    .filter((v) => Number.isFinite(v) && v > 0);
+  const taxiAvg = taxiValues.length ? taxiValues.reduce((s, v) => s + v, 0) / taxiValues.length : null;
+
+  el.innerHTML = `
+    <div class="airport-title">${escapeHtml(a?.city || code)}</div>
+    <div class="airport-sub">${escapeHtml(code)}${a?.name ? ' · ' + escapeHtml(a.name) : ''}</div>
+
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="label">Départs</div><div class="value">${dep.length}</div></div>
+      <div class="stat-tile"><div class="label">Arrivées</div><div class="value">${arr.length}</div></div>
+      <div class="stat-tile"><div class="label">Total</div><div class="value">${dep.length + arr.length}</div></div>
+      <div class="stat-tile"><div class="label">Taxi moyen (départ)</div><div class="value">${taxiAvg != null ? Math.round(taxiAvg) + ' min' : '—'}</div></div>
+    </div>
+
+    <div class="chart-card">
+      <h3>Pistes de décollage</h3>
+      ${barChartHtml(runwayDep)}
+    </div>
+    <div class="chart-card">
+      <h3>Pistes d'atterrissage</h3>
+      ${barChartHtml(runwayArr)}
+    </div>
+    <div class="chart-card">
+      <h3>Portes d'embarquement</h3>
+      ${barChartHtml(gates)}
+    </div>
+  `;
+}
+
 async function renderSettings() {
   headerTitle.textContent = 'Réglages';
   const lastImport = await db.getMeta('lastImport');
   const folderName = await db.getMeta('folderName');
-  const notionLastImport = await db.getMeta('notionLastImport');
-  const notionFolderName = await db.getMeta('notionFolderName');
 
   viewRoot.innerHTML = `
     <div class="settings-section">
-      <h2>Traces de vol (KML)</h2>
+      <h2>Dossier de données</h2>
       <div class="settings-card">
         <div class="settings-row"><span class="k">Dossier</span><span>${folderName ? escapeHtml(folderName) : 'Non défini'}</span></div>
-        <div class="settings-row"><span class="k">Vols importés</span><span>${flights.length}</span></div>
         <div class="settings-row"><span class="k">Dernier import</span><span>${lastImport ? new Date(lastImport).toLocaleString('fr-FR') : 'Jamais'}</span></div>
+        <div class="settings-row"><span class="k">Traces de vol</span><span>${flights.length}</span></div>
+        <div class="settings-row"><span class="k">Vols enrichis (Notion)</span><span>${notionByKey.size}</span></div>
         <div class="settings-actions">
-          <button class="primary" id="pick-folder-btn">Choisir le dossier KML</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="settings-section">
-      <h2>Détails de vol (Notion)</h2>
-      <div class="settings-card">
-        <div class="settings-row"><span class="k">Dossier</span><span>${notionFolderName ? escapeHtml(notionFolderName) : 'Non défini'}</span></div>
-        <div class="settings-row"><span class="k">Vols enrichis</span><span>${notionByKey.size}</span></div>
-        <div class="settings-row"><span class="k">Dernier import</span><span>${notionLastImport ? new Date(notionLastImport).toLocaleString('fr-FR') : 'Jamais'}</span></div>
-        <div class="settings-actions">
-          <button class="primary" id="pick-notion-btn">Choisir le dossier Notion</button>
+          <button class="primary" id="pick-folder-btn">Choisir le dossier</button>
+          <button class="secondary" id="refresh-btn">Rafraîchir (efface et réimporte tout)</button>
         </div>
         <p style="margin:10px 0 0; font-size:12px; color:var(--text-dim); line-height:1.4;">
-          Exporte ta base Notion "Flight History" en CSV (··· → Export) dans un dossier, puis sélectionne ce
-          dossier ici. Le rapprochement avec les traces KML se fait par numéro de vol + date.
+          Choisis directement ton dossier FlighTim (ou tout dossier parent) : l'app scanne récursivement
+          tous les sous-dossiers et récupère elle-même les .kml (FlightRadar24), les .json (FlightAware)
+          et les exports CSV Notion "Flight History" (··· → Export) qu'elle y trouve — le reste (PDF,
+          tableurs, etc.) est ignoré. Le rapprochement KML/JSON ↔ Notion se fait par numéro de vol + date.
+          "Rafraîchir" vide d'abord toutes les données locales puis réimporte depuis le dossier que tu
+          choisis ensuite — utile si des fichiers source ont été modifiés ou supprimés depuis le dernier
+          import (un import normal ignore les fichiers inchangés et ne détecte pas les suppressions).
         </p>
       </div>
     </div>
@@ -508,7 +993,7 @@ async function renderSettings() {
       <h2>À propos</h2>
       <div class="settings-card">
         <p style="margin:0; font-size:13px; color:var(--text-dim); line-height:1.5;">
-          FlighTim lit vos exports .kml (FlightRadar24 / FlightAware) et vos exports CSV Notion
+          FlighTim lit vos exports .kml (FlightRadar24), .json (FlightAware) et vos exports CSV Notion
           directement dans votre navigateur — aucune donnée n'est envoyée à un serveur. Les fichiers sont
           lus localement, puis stockés sur cet appareil pour un accès hors-ligne.
         </p>
@@ -516,8 +1001,15 @@ async function renderSettings() {
     </div>
   `;
 
-  document.getElementById('pick-folder-btn').addEventListener('click', () => folderInput.click());
-  document.getElementById('pick-notion-btn').addEventListener('click', () => notionInput.click());
+  document.getElementById('pick-folder-btn').addEventListener('click', () => {
+    pendingRefresh = false;
+    folderInput.click();
+  });
+  document.getElementById('refresh-btn').addEventListener('click', () => {
+    if (!confirm('Effacer toutes les données locales puis tout réimporter depuis le dossier que tu vas choisir ?')) return;
+    pendingRefresh = true;
+    folderInput.click();
+  });
   document.getElementById('clear-btn').addEventListener('click', async () => {
     if (!confirm('Supprimer tous les vols et données Notion importés sur cet appareil ?')) return;
     await db.clearFlights();
@@ -525,8 +1017,6 @@ async function renderSettings() {
     await db.setFlightFileStamps({});
     await db.setMeta('lastImport', null);
     await db.setMeta('folderName', null);
-    await db.setMeta('notionLastImport', null);
-    await db.setMeta('notionFolderName', null);
     flights = [];
     notionByKey = new Map();
     showToast('Données effacées');
@@ -537,34 +1027,66 @@ async function renderSettings() {
 // ---------- Import ----------
 
 folderInput.addEventListener('change', async () => {
-  const files = [...folderInput.files].filter((f) => /\.kml$/i.test(f.name));
+  const allFiles = [...folderInput.files];
   folderInput.value = '';
-  if (files.length === 0) {
-    showToast('Aucun fichier .kml trouvé dans ce dossier');
+  const isRefresh = pendingRefresh;
+  pendingRefresh = false;
+
+  let traceFiles = allFiles.filter((f) => /\.(kml|json)$/i.test(f.name));
+  const csvFiles = allFiles.filter((f) => /\.csv$/i.test(f.name));
+
+  if (traceFiles.length === 0 && csvFiles.length === 0) {
+    showToast('Aucun fichier .kml, .json ou .csv trouvé dans ce dossier');
     return;
   }
 
-  showToast(`Import de ${files.length} fichier(s)…`, 60000);
+  // "Rafraîchir" : on ne vide les données locales qu'une fois qu'on sait que
+  // l'utilisateur a effectivement choisi un dossier avec des fichiers
+  // exploitables — jamais avant, pour ne rien perdre si le sélecteur est
+  // annulé ou pointe sur un mauvais dossier.
+  if (isRefresh) {
+    await db.clearFlights();
+    await db.clearNotionFlights();
+    await db.setFlightFileStamps({});
+    flights = [];
+    notionByKey = new Map();
+  }
+
+  // Le raccourci FlightAware peut exporter le .kml (pauvre) et le .json
+  // (riche) d'un même vol sous le même nom de base : on ignore alors le KML
+  // pour ne garder qu'une seule entrée, celle avec le plus de données.
+  const jsonBaseNames = new Set(
+    traceFiles.filter((f) => /\.json$/i.test(f.name)).map((f) => f.name.replace(/\.json$/i, ''))
+  );
+  traceFiles = traceFiles.filter((f) => !(
+    /\.kml$/i.test(f.name) && jsonBaseNames.has(f.name.replace(/\.kml$/i, ''))
+  ));
+
+  showToast(`Import de ${traceFiles.length + csvFiles.length} fichier(s)…`, 60000);
+
+  // --- Traces de vol (.kml / .json) ---
   const stamps = await db.getFlightFileStamps();
   const newStamps = { ...stamps };
   const toStore = [];
-  let skipped = 0, errors = 0;
+  let flightsSkipped = 0, flightsErrors = 0;
 
-  for (const file of files) {
+  for (const file of traceFiles) {
     const stampKey = file.webkitRelativePath || file.name;
     const prevStamp = stamps[stampKey];
     if (prevStamp && prevStamp.size === file.size && prevStamp.lastModified === file.lastModified) {
-      skipped++;
+      flightsSkipped++;
       continue;
     }
     try {
       const text = await file.text();
-      const parsed = parseKML(text, file.name);
+      const parsed = /\.json$/i.test(file.name)
+        ? parseFlightAwareJSON(text, file.name)
+        : parseKML(text, file.name);
       toStore.push(parsed);
       newStamps[stampKey] = { size: file.size, lastModified: file.lastModified };
     } catch (err) {
       console.error(err);
-      errors++;
+      flightsErrors++;
     }
   }
 
@@ -576,38 +1098,21 @@ folderInput.addEventListener('change', async () => {
     }
     flights.sort(flightSortCompare);
   }
-
   await db.setFlightFileStamps(newStamps);
-  await db.setMeta('lastImport', Date.now());
-  const root = files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : null;
-  if (root) await db.setMeta('folderName', root);
 
-  document.querySelectorAll('.toast').forEach((t) => t.remove());
-  showToast(`${toStore.length} vol(s) importé(s) · ${skipped} inchangé(s)${errors ? ' · ' + errors + ' erreur(s)' : ''}`);
-  render();
-});
-
-notionInput.addEventListener('change', async () => {
-  const files = [...notionInput.files].filter((f) => /\.csv$/i.test(f.name));
-  notionInput.value = '';
-  if (files.length === 0) {
-    showToast('Aucun fichier .csv trouvé dans ce dossier');
-    return;
-  }
-
-  showToast(`Import Notion de ${files.length} fichier(s)…`, 60000);
+  // --- Détails de vol (.csv Notion) ---
   const allRecords = [];
-  let ignoredFiles = 0, errors = 0;
+  let csvIgnored = 0, csvErrors = 0;
 
-  for (const file of files) {
+  for (const file of csvFiles) {
     try {
       const text = await file.text();
       const records = parseNotionCSV(text, file.name);
-      if (records === null) { ignoredFiles++; continue; }
+      if (records === null) { csvIgnored++; continue; }
       allRecords.push(...records);
     } catch (err) {
       console.error(err);
-      errors++;
+      csvErrors++;
     }
   }
 
@@ -616,14 +1121,19 @@ notionInput.addEventListener('change', async () => {
     for (const r of allRecords) notionByKey.set(r.key, r);
   }
 
-  await db.setMeta('notionLastImport', Date.now());
-  const root = files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : null;
-  if (root) await db.setMeta('notionFolderName', root);
+  await db.setMeta('lastImport', Date.now());
+  const root = allFiles[0]?.webkitRelativePath ? allFiles[0].webkitRelativePath.split('/')[0] : null;
+  if (root) await db.setMeta('folderName', root);
 
   document.querySelectorAll('.toast').forEach((t) => t.remove());
-  showToast(`${allRecords.length} ligne(s) Notion importée(s)`
-    + (ignoredFiles ? ` · ${ignoredFiles} fichier(s) ignoré(s) (pas un export de vols)` : '')
-    + (errors ? ` · ${errors} erreur(s)` : ''));
+  const summary = [];
+  if (traceFiles.length) {
+    summary.push(`${toStore.length} vol(s) · ${flightsSkipped} inchangé(s)${flightsErrors ? ' · ' + flightsErrors + ' erreur(s)' : ''}`);
+  }
+  if (csvFiles.length) {
+    summary.push(`${allRecords.length} ligne(s) Notion${csvIgnored ? ' · ' + csvIgnored + ' fichier(s) ignoré(s)' : ''}${csvErrors ? ' · ' + csvErrors + ' erreur(s)' : ''}`);
+  }
+  showToast(summary.join(' — '));
   render();
 });
 

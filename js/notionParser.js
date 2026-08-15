@@ -89,6 +89,19 @@ function to24h(hStr, minStr, ampm) {
 // entre les deux reste juste même sans le convertir en UTC réel. On encode le
 // résultat via Date.UTC() pour obtenir un timestamp stable, comparable et
 // facile à reformater (getUTCHours/getUTCMinutes) sans dérive de fuseau local.
+// Extrait le décalage horaire entre parenthèses ("(GMT+2)", "(GMT-5)") que
+// parseNotionDateTime ignore pour le calcul de durée/retard, mais qu'on veut
+// pouvoir afficher tel quel (écart par rapport à l'heure Zulu) côté détail
+// de vol. STD/ATD partagent toujours le même décalage (aéroport de départ),
+// idem STA/ATA (aéroport d'arrivée), donc un seul appel par côté suffit.
+export function parseNotionUtcOffsetMinutes(value) {
+  const m = /GMT\s*([+-]\d{1,2})(?::?(\d{2}))?/i.exec(value || '');
+  if (!m) return null;
+  const h = Number(m[1]);
+  const mins = m[2] ? Number(m[2]) : 0;
+  return (h < 0 ? -1 : 1) * (Math.abs(h) * 60 + mins);
+}
+
 export function parseNotionDateTime(value) {
   if (!value) return null;
   let m = /([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i.exec(value);
@@ -167,6 +180,8 @@ export function parseNotionCSV(text, filename) {
     rec.ataAt = parseNotionDateTime(rec.ata);
     rec.boardingStartAt = parseNotionDateTime(rec.boardingStart);
     rec.boardingEndAt = parseNotionDateTime(rec.boardingEnd);
+    rec.depUtcOffsetMin = parseNotionUtcOffsetMinutes(rec.std || rec.atd);
+    rec.arrUtcOffsetMin = parseNotionUtcOffsetMinutes(rec.sta || rec.ata);
     out.push(rec);
   }
   return out;

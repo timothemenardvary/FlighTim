@@ -39,7 +39,7 @@ export function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function pathDistanceKm(points) {
+export function pathDistanceKm(points) {
   let total = 0;
   for (let i = 1; i < points.length; i++) {
     total += haversineKm(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
@@ -47,7 +47,7 @@ function pathDistanceKm(points) {
   return total;
 }
 
-function decimate(points, maxPoints = 600) {
+export function decimate(points, maxPoints = 600) {
   if (points.length <= maxPoints) return points;
   const step = points.length / maxPoints;
   const out = [];
@@ -206,6 +206,14 @@ export function parseKML(xmlText, filename) {
     date,
     startTime,
     endTime,
+    // Horaires "porte" détaillés (programmé/réel), exposés à part de
+    // startTime/endTime pour l'affichage Départ/Arrivée du détail de vol —
+    // même convention (epoch ms) que Notion/FlightAware, aucune section
+    // décollage/atterrissage distincte côté FR24 (pas dans le KML scrappé).
+    depGateSchedAt: meta.std ? new Date(meta.std).getTime() : null,
+    depGateActualAt: meta.atd ? new Date(meta.atd).getTime() : null,
+    arrGateSchedAt: meta.sta ? new Date(meta.sta).getTime() : null,
+    arrGateActualAt: (meta.ata || meta.eta) ? new Date(meta.ata || meta.eta).getTime() : null,
     distanceKm: Math.round(distanceKm),
     maxAltitude: Math.round(maxAltitude),
     maxSpeed: maxSpeed ? Math.round(maxSpeed) : null,
