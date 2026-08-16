@@ -53,6 +53,12 @@ export async function clearFlights() {
   return withStore('flights', 'readwrite', (store) => store.clear());
 }
 
+export async function deleteFlights(ids) {
+  return withStore('flights', 'readwrite', (store) => {
+    for (const id of ids) store.delete(id);
+  });
+}
+
 export async function getAllNotionFlights() {
   return withStore('notionFlights', 'readonly', (store) => {
     return new Promise((resolve, reject) => {

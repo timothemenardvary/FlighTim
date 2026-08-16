@@ -179,6 +179,41 @@ html, body {
 .empty-state .big-emoji { font-size: 44px; display: block; margin-bottom: 12px; }
 .empty-state button { margin-top: 18px; }
 
+.search-bar {
+  position: relative;
+  margin-bottom: 14px;
+}
+.search-bar .search-icon {
+  position: absolute;
+  left: 13px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+  opacity: 0.55;
+  pointer-events: none;
+}
+.search-bar input {
+  width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 11px 14px 11px 38px;
+  font-size: 15px;
+  color: var(--text);
+  font-family: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.search-bar input::placeholder { color: var(--text-dim); }
+.search-bar input:focus { outline: none; border-color: var(--accent); }
+
+.no-results {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
 /* Buttons */
 button.primary, .btn-primary {
   background: var(--accent);
@@ -441,6 +476,12 @@ button.danger { color: var(--danger); }
 .info-row .good { color: var(--accent-2); font-weight: 600; }
 .info-row .warn { color: var(--warn); font-weight: 600; }
 .info-row .bad { color: var(--danger); font-weight: 600; }
+.info-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+.info-link:active { opacity: 0.7; }
 
 .time-sched-inline {
   color: var(--text-dim);
@@ -578,6 +619,15 @@ select {
   align-items: center;
   gap: 8px;
 }
+.bar-row-link {
+  text-decoration: none;
+  color: inherit;
+  border-radius: 8px;
+  margin: 0 -6px;
+  padding: 0 6px;
+}
+.bar-row-link:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.bar-row-link .bar-label { color: var(--accent); }
 .bar-label {
   font-size: 12px;
   color: var(--text-dim);

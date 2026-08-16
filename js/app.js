@@ -20,6 +20,7 @@ let pendingRefresh = false; // le prochain choix de dossier doit d'abord tout ef
 let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
 let statsYear = 'all'; // filtre année partagé par les deux sous-vues de la page Stats
 let selectedAirport = null; // aéroport choisi dans le détail de la page Stats > Aéroports
+let flightSearchQuery = ''; // texte de la barre de recherche, page Liste des vols
 
 function notionKeyFor(flight) {
   return `${(flight.flightNumber || '').toUpperCase()}|${flight.date || ''}`;
@@ -184,6 +185,13 @@ function infoRow(label, value) {
   return `<div class="info-row"><span class="k">${escapeHtml(label)}</span><span>${escapeHtml(value)}</span></div>`;
 }
 
+// Variante de infoRow() dont la valeur est un lien hash (ex. vers la fiche
+// avion) plutôt qu'un simple texte.
+function infoRowLink(label, value, route) {
+  if (!value) return '';
+  return `<div class="info-row"><span class="k">${escapeHtml(label)}</span><a href="${escapeHtml(route)}" class="info-link">${escapeHtml(value)}</a></div>`;
+}
+
 function delayMinutes(schedTs, actualTs) {
   return (schedTs != null && actualTs != null) ? (actualTs - schedTs) / 60000 : null;
 }
@@ -326,6 +334,9 @@ function render() {
   if (route.startsWith('#/flight/')) {
     const id = decodeURIComponent(route.slice('#/flight/'.length));
     renderFlightDetail(id);
+  } else if (route.startsWith('#/aircraft/')) {
+    const registration = decodeURIComponent(route.slice('#/aircraft/'.length));
+    renderAircraftDetail(registration);
   } else if (route === '#/map') {
     renderAllMap();
   } else if (route === '#/stats') {
@@ -338,6 +349,58 @@ function render() {
 }
 
 // ---------- Views ----------
+
+// Texte normalisé (majuscules, sans espaces) dans lequel chercher : numéro de
+// vol, compagnie, et itinéraire écrit "collé" façon "CDGNCE" pour qu'une
+// recherche de ce type matche sans que l'utilisateur ait à connaître le
+// séparateur utilisé à l'affichage.
+function flightSearchHaystack(f) {
+  const route = `${f.depIata || ''}${f.arrIata || ''}`;
+  return [f.flightNumber, f.airline, route].join(' ').toUpperCase();
+}
+
+function matchesFlightSearch(f, query) {
+  if (!query) return true;
+  return flightSearchHaystack(f).includes(query);
+}
+
+function flightCardHtml(f) {
+  return `
+    <div class="flight-card" data-id="${escapeHtml(f.id)}">
+      <div class="route">
+        <div class="route-cities">
+          <span>${escapeHtml(f.depIata || '???')}</span>
+          <span class="route-arrow">&#9992;</span>
+          <span>${escapeHtml(f.arrIata || '???')}</span>
+          <span class="flight-number-badge">${escapeHtml(f.flightNumber)}</span>
+        </div>
+        <div class="flight-meta">${fmtDate(f.date)}${f.airline ? ' · ' + escapeHtml(f.airline) : ''}${f.isVirtual ? ' · sans trace GPS' : ''}</div>
+      </div>
+      <div class="chevron">&#8250;</div>
+    </div>`;
+}
+
+// Liste de flight-card avec en-têtes de mois, partagée entre la liste
+// principale (page Vols) et la liste de vols de la fiche avion.
+function flightListHtml(flightsSorted) {
+  let html = '';
+  let lastMonth = null;
+  for (const f of flightsSorted) {
+    const monthKey = f.date ? f.date.slice(0, 7) : 'inconnu';
+    if (monthKey !== lastMonth) {
+      html += `<div class="month-header">${f.date ? fmtMonthHeader(f.date) : 'Date inconnue'}</div>`;
+      lastMonth = monthKey;
+    }
+    html += flightCardHtml(f);
+  }
+  return html;
+}
+
+function wireFlightCards(root) {
+  root.querySelectorAll('.flight-card').forEach((card) => {
+    card.addEventListener('click', () => navigate('#/flight/' + encodeURIComponent(card.dataset.id)));
+  });
+}
 
 function renderFlightsList() {
   headerTitle.textContent = 'FlighTim';
@@ -354,33 +417,35 @@ function renderFlightsList() {
     return;
   }
 
-  let html = '';
-  let lastMonth = null;
-  for (const f of displayFlights) {
-    const monthKey = f.date ? f.date.slice(0, 7) : 'inconnu';
-    if (monthKey !== lastMonth) {
-      html += `<div class="month-header">${f.date ? fmtMonthHeader(f.date) : 'Date inconnue'}</div>`;
-      lastMonth = monthKey;
-    }
-    html += `
-      <div class="flight-card" data-id="${escapeHtml(f.id)}">
-        <div class="route">
-          <div class="route-cities">
-            <span>${escapeHtml(f.depIata || '???')}</span>
-            <span class="route-arrow">&#9992;</span>
-            <span>${escapeHtml(f.arrIata || '???')}</span>
-            <span class="flight-number-badge">${escapeHtml(f.flightNumber)}</span>
-          </div>
-          <div class="flight-meta">${fmtDate(f.date)}${f.airline ? ' · ' + escapeHtml(f.airline) : ''}${f.isVirtual ? ' · sans trace GPS' : ''}</div>
-        </div>
-        <div class="chevron">&#8250;</div>
-      </div>`;
-  }
-  viewRoot.innerHTML = html;
+  viewRoot.innerHTML = `
+    <div class="search-bar">
+      <span class="search-icon">&#128269;</span>
+      <input type="search" id="flight-search-input" placeholder="Numéro de vol, compagnie, itinéraire (ex. CDGNCE)…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHtml(flightSearchQuery)}">
+    </div>
+    <div id="flights-list"></div>`;
 
-  viewRoot.querySelectorAll('.flight-card').forEach((card) => {
-    card.addEventListener('click', () => navigate('#/flight/' + encodeURIComponent(card.dataset.id)));
+  const listEl = document.getElementById('flights-list');
+
+  function renderList() {
+    const query = flightSearchQuery.trim().toUpperCase();
+    const filtered = displayFlights.filter((f) => matchesFlightSearch(f, query));
+
+    if (filtered.length === 0) {
+      listEl.innerHTML = `<div class="no-results">Aucun vol ne correspond à « ${escapeHtml(flightSearchQuery.trim())} ».</div>`;
+      return;
+    }
+
+    listEl.innerHTML = flightListHtml(filtered);
+    wireFlightCards(listEl);
+  }
+
+  const searchInput = document.getElementById('flight-search-input');
+  searchInput.addEventListener('input', () => {
+    flightSearchQuery = searchInput.value;
+    renderList();
   });
+
+  renderList();
 }
 
 // Prépare le canvas une seule fois (taille, échelle DPR) et renvoie une
@@ -457,6 +522,7 @@ function renderFlightDetail(id) {
     depTakeoffSched, depTakeoffActual, arrLandingSched, arrLandingActual,
   } = flightGateTimes(f);
   const hasGateTimes = depGateActual != null || arrGateActual != null;
+  const registration = f.registration || n?.registration || null;
 
   const depDelayMin = delayMinutes(depGateSched, depGateActual);
   const arrDelayMin = delayMinutes(arrGateSched, arrGateActual);
@@ -587,7 +653,7 @@ function renderFlightDetail(id) {
 
     <div class="info-list">
       ${infoRow('Appareil', f.aircraftType)}
-      ${infoRow('Immatriculation', f.registration || n?.registration)}
+      ${registration ? infoRowLink('Immatriculation', registration, '#/aircraft/' + encodeURIComponent(registration)) : ''}
       ${infoRow('Indicatif', f.callsign)}
       ${infoRow('Cabine', n?.cabin)}
       ${infoRow('Siège', n?.seats && n?.seatType ? `${n.seats} · ${n.seatType}` : (n?.seats || n?.seatType))}
@@ -748,19 +814,22 @@ function delayBarColor(min) {
 // Au-delà de `limit`, les lignes restent dans le DOM mais cachées ; un clic
 // sur "+ N autres" les déplie (cf. wireBarChartToggles, à appeler après
 // insertion dans le document).
-function barChartHtml(rows, { formatValue, colorFor, limit } = {}) {
+function barChartHtml(rows, { formatValue, colorFor, limit, rowHref } = {}) {
   if (rows.length === 0) return '<p class="stats-empty">Pas assez de données.</p>';
   const maxVal = Math.max(...rows.map(([, v]) => Math.abs(v)), 1);
   const renderRow = ([label, value]) => {
     const pct = Math.min(100, (Math.abs(value) / maxVal) * 100);
     const color = colorFor ? colorFor(value) : 'var(--accent)';
     const valueStr = formatValue ? formatValue(value) : String(value);
+    const href = rowHref ? rowHref(label) : null;
+    const tag = href ? 'a' : 'div';
+    const hrefAttr = href ? ` href="${escapeHtml(href)}"` : '';
     return `
-      <div class="bar-row">
+      <${tag} class="bar-row${href ? ' bar-row-link' : ''}"${hrefAttr}>
         <div class="bar-label">${escapeHtml(label)}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${color};"></div></div>
         <div class="bar-value">${escapeHtml(valueStr)}</div>
-      </div>`;
+      </${tag}>`;
   };
 
   const truncated = limit && rows.length > limit;
@@ -886,7 +955,7 @@ function renderFlightStats(content, flights) {
 
     <div class="chart-card">
       <h3>Vols par immatriculation</h3>
-      ${barChartHtml(byRegistration, { limit: 12 })}
+      ${barChartHtml(byRegistration, { limit: 12, rowHref: (reg) => reg === 'Inconnu(e)' ? null : '#/aircraft/' + encodeURIComponent(reg) })}
     </div>
   `;
   wireBarChartToggles(content);
@@ -980,6 +1049,48 @@ function renderAirportDetail(el, { dep, arr }, code) {
     </div>
   `;
   wireBarChartToggles(el);
+}
+
+// Fiche avion : accessible depuis une immatriculation cliquée n'importe où
+// dans l'app (détail de vol, stats). Regroupe tous les vols enregistrés pour
+// cette immatriculation, toutes sources confondues (KML/JSON + Notion).
+function renderAircraftDetail(registration) {
+  const norm = (registration || '').trim();
+  headerTitle.textContent = norm || 'Avion';
+
+  const matched = buildDisplayFlights()
+    .filter((f) => ((f.registration || nFor(f)?.registration || '').trim()) === norm)
+    .sort(flightSortCompare); // plus récent en premier
+
+  if (!norm || matched.length === 0) {
+    viewRoot.innerHTML = `<button class="back-btn" id="back-btn">&#8249; Retour</button><div class="empty-state">Avion introuvable.</div>`;
+    document.getElementById('back-btn').addEventListener('click', () => history.back());
+    return;
+  }
+
+  const aircraftType = matched.map((f) => f.aircraftType).find((t) => t) || null;
+  const firstFlight = matched[matched.length - 1];
+  const lastFlight = matched[0];
+
+  viewRoot.innerHTML = `
+    <button class="back-btn" id="back-btn">&#8249; Retour</button>
+    <div class="airport-title">${escapeHtml(norm)}</div>
+    <div class="airport-sub">${aircraftType ? escapeHtml(aircraftType) : "Type d'avion inconnu"}</div>
+
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="label">Vols</div><div class="value">${matched.length}</div></div>
+      <div class="stat-tile"><div class="label">Premier vol</div><div class="value">${firstFlight.date ? fmtDate(firstFlight.date) : '—'}</div></div>
+      <div class="stat-tile"><div class="label">Dernier vol</div><div class="value">${lastFlight.date ? fmtDate(lastFlight.date) : '—'}</div></div>
+    </div>
+
+    <div id="aircraft-flights"></div>
+  `;
+
+  document.getElementById('back-btn').addEventListener('click', () => history.back());
+
+  const listEl = document.getElementById('aircraft-flights');
+  listEl.innerHTML = flightListHtml(matched);
+  wireFlightCards(listEl);
 }
 
 async function renderSettings() {
@@ -1083,16 +1194,6 @@ folderInput.addEventListener('change', async () => {
     notionByKey = new Map();
   }
 
-  // Le raccourci FlightAware peut exporter le .kml (pauvre) et le .json
-  // (riche) d'un même vol sous le même nom de base : on ignore alors le KML
-  // pour ne garder qu'une seule entrée, celle avec le plus de données.
-  const jsonBaseNames = new Set(
-    traceFiles.filter((f) => /\.json$/i.test(f.name)).map((f) => f.name.replace(/\.json$/i, ''))
-  );
-  traceFiles = traceFiles.filter((f) => !(
-    /\.kml$/i.test(f.name) && jsonBaseNames.has(f.name.replace(/\.kml$/i, ''))
-  ));
-
   showToast(`Import de ${traceFiles.length + csvFiles.length} fichier(s)…`, 60000);
 
   // --- Traces de vol (.kml / .json) ---
@@ -1122,8 +1223,30 @@ folderInput.addEventListener('change', async () => {
   }
 
   if (toStore.length) {
-    await db.putFlights(toStore);
-    for (const f of toStore) {
+    // Le raccourci FlightAware peut exporter le .kml (pauvre) et le .json
+    // (riche) d'un même vol sous des noms de fichiers différents (le .json
+    // inclut la date, pas le .kml) : on ne peut donc pas dédupliquer sur le
+    // nom de fichier. On identifie plutôt les vols en double par numéro de
+    // vol + date (comme pour Notion, cf. notionKeyFor) et on ne garde que
+    // l'entrée FlightAware JSON, y compris si l'autre a été importée lors
+    // d'une session précédente.
+    const traceKeyFor = (f) => `${(f.flightNumber || '').toUpperCase()}|${f.date || ''}`;
+    const allCandidates = [...flights, ...toStore];
+    const richKeys = new Set(
+      allCandidates.filter((f) => f.source === 'flightaware-json').map(traceKeyFor)
+    );
+    const idsToDrop = new Set(
+      allCandidates
+        .filter((f) => f.source !== 'flightaware-json' && richKeys.has(traceKeyFor(f)))
+        .map((f) => f.id)
+    );
+
+    const filteredToStore = toStore.filter((f) => !idsToDrop.has(f.id));
+    if (idsToDrop.size) await db.deleteFlights(idsToDrop);
+    if (filteredToStore.length) await db.putFlights(filteredToStore);
+
+    flights = flights.filter((f) => !idsToDrop.has(f.id));
+    for (const f of filteredToStore) {
       const idx = flights.findIndex((x) => x.id === f.id);
       if (idx >= 0) flights[idx] = f; else flights.push(f);
     }
