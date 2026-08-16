@@ -1,6 +1,7 @@
 import { parseKML, haversineKm } from './kmlParser.js';
 import { parseFlightAwareJSON } from './flightAwareParser.js';
 import { parseNotionCSV } from './notionParser.js';
+import { parseNotionFlightPage, resolveRelativePath } from './notionHtmlParser.js';
 import * as db from './db.js';
 import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot, createPlaneMarker } from './mapView.js';
 import { lookupAirport } from './airports.js';
@@ -21,6 +22,7 @@ let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
 let statsYear = 'all'; // filtre année partagé par les deux sous-vues de la page Stats
 let selectedAirport = null; // aéroport choisi dans le détail de la page Stats > Aéroports
 let flightSearchQuery = ''; // texte de la barre de recherche, page Liste des vols
+let flightPhotoObjectUrl = null; // URL blob de la photo perso affichée sur le détail de vol, à révoquer au prochain rendu
 
 function notionKeyFor(flight) {
   return `${(flight.flightNumber || '').toUpperCase()}|${flight.date || ''}`;
@@ -506,6 +508,10 @@ function setupAltitudeChart(canvas, points) {
 }
 
 function renderFlightDetail(id) {
+  // Révoque l'URL blob de la photo perso du rendu précédent (page quittée
+  // ou vol différent) avant d'en créer éventuellement une nouvelle.
+  if (flightPhotoObjectUrl) { URL.revokeObjectURL(flightPhotoObjectUrl); flightPhotoObjectUrl = null; }
+
   const f = buildDisplayFlights().find((x) => x.id === id);
   headerTitle.textContent = f ? f.flightNumber : 'Vol';
 
@@ -523,6 +529,12 @@ function renderFlightDetail(id) {
   } = flightGateTimes(f);
   const hasGateTimes = depGateActual != null || arrGateActual != null;
   const registration = f.registration || n?.registration || null;
+
+  // Photo perso jointe à ce vol dans Notion (prioritaire, souvenir du vol
+  // lui-même) plutôt que la photo générique de l'appareil via FlightAware.
+  const photo = n?.photoBlob
+    ? { kind: 'personal' }
+    : (f.photoUrl ? { kind: 'flightaware', url: f.photoUrl } : null);
 
   const depDelayMin = delayMinutes(depGateSched, depGateActual);
   const arrDelayMin = delayMinutes(arrGateSched, arrGateActual);
@@ -610,6 +622,7 @@ function renderFlightDetail(id) {
     </div>
     <div class="hero-date">${fmtDate(f.date)}</div>
     ${primaryDelay ? `<div class="status-pill ${primaryDelay.cls}">${primaryDelay.label}</div>` : ''}
+    ${n?.notes ? `<div class="note-card"><div class="note-card-label">Note</div>${escapeHtml(n.notes)}</div>` : ''}
 
     ${depRows ? `
     <div class="leg-card leg-dep">
@@ -631,11 +644,11 @@ function renderFlightDetail(id) {
       <div class="info-list">${arrRows}</div>
     </div>` : ''}
 
-    ${f.photoUrl ? `
+    ${photo ? `
     <div class="aircraft-photo" id="aircraft-photo-wrap">
-      <img id="aircraft-photo-img" alt="Photo de l'appareil" loading="lazy" />
-      <div class="aircraft-photo-fallback" id="aircraft-photo-fallback">Photo indisponible hors ligne</div>
-      <span class="aircraft-photo-credit">Photo : FlightAware</span>
+      <img id="aircraft-photo-img" alt="${photo.kind === 'personal' ? 'Photo du vol' : "Photo de l'appareil"}" loading="lazy" />
+      <div class="aircraft-photo-fallback" id="aircraft-photo-fallback">Photo indisponible${photo.kind === 'flightaware' ? ' hors ligne' : ''}</div>
+      ${photo.kind === 'flightaware' ? '<span class="aircraft-photo-credit">Photo : FlightAware</span>' : ''}
     </div>` : ''}
 
     <div class="stat-grid">
@@ -665,15 +678,21 @@ function renderFlightDetail(id) {
 
   document.getElementById('back-btn').addEventListener('click', () => navigate('#/flights'));
 
-  if (f.photoUrl) {
+  if (photo) {
     const img = document.getElementById('aircraft-photo-img');
     // Écouteur posé avant d'assigner src : si le chargement échoue (hors
-    // ligne, lien mort...) on bascule sur le texte de repli plutôt que de
-    // laisser une icône d'image cassée.
+    // ligne, lien mort, format non supporté par le navigateur...) on
+    // bascule sur le texte de repli plutôt que de laisser une icône
+    // d'image cassée.
     img.addEventListener('error', () => {
       document.getElementById('aircraft-photo-wrap')?.classList.add('is-fallback');
     });
-    img.src = f.photoUrl;
+    if (photo.kind === 'personal') {
+      flightPhotoObjectUrl = URL.createObjectURL(n.photoBlob);
+      img.src = flightPhotoObjectUrl;
+    } else {
+      img.src = photo.url;
+    }
   }
 
   if (hasRealTrack) {
@@ -1113,8 +1132,10 @@ async function renderSettings() {
         <p style="margin:10px 0 0; font-size:12px; color:var(--text-dim); line-height:1.4;">
           Choisis directement ton dossier FlighTim (ou tout dossier parent) : l'app scanne récursivement
           tous les sous-dossiers et récupère elle-même les .kml (FlightRadar24), les .json (FlightAware)
-          et les exports CSV Notion "Flight History" (··· → Export) qu'elle y trouve — le reste (PDF,
+          et les exports Notion "Flight History" (··· → Export), au format CSV comme HTML — le reste (PDF,
           tableurs, etc.) est ignoré. Le rapprochement KML/JSON ↔ Notion se fait par numéro de vol + date.
+          Avec un export Notion au format HTML, les notes et photos que tu as ajoutées à un vol sont
+          récupérées automatiquement et affichées sur sa page de détail.
           "Rafraîchir" vide d'abord toutes les données locales puis réimporte depuis le dossier que tu
           choisis ensuite — utile si des fichiers source ont été modifiés ou supprimés depuis le dernier
           import (un import normal ignore les fichiers inchangés et ne détecte pas les suppressions).
@@ -1176,9 +1197,20 @@ folderInput.addEventListener('change', async () => {
 
   let traceFiles = allFiles.filter((f) => /\.(kml|json)$/i.test(f.name));
   const csvFiles = allFiles.filter((f) => /\.csv$/i.test(f.name));
+  // Pages individuelles d'un export Notion "HTML & Markdown" (une par ligne
+  // "Flight History" ayant une note et/ou une photo) : enrichissement
+  // optionnel, cf. notionHtmlParser.js. Un export complet contient aussi des
+  // centaines de fiches Aircraft/Airports (même motif .html, jamais de
+  // propriété Date) : on les exclut ici via le sous-dossier plutôt que de
+  // payer une lecture + un DOMParser pour chacune avant de les jeter.
+  const notionPageFiles = allFiles.filter((f) => {
+    if (!/\.html?$/i.test(f.name)) return false;
+    const relPath = f.webkitRelativePath || '';
+    return !relPath || /\/Flight History\//i.test(relPath);
+  });
 
-  if (traceFiles.length === 0 && csvFiles.length === 0) {
-    showToast('Aucun fichier .kml, .json ou .csv trouvé dans ce dossier');
+  if (traceFiles.length === 0 && csvFiles.length === 0 && notionPageFiles.length === 0) {
+    showToast('Aucun fichier .kml, .json, .csv ou .html trouvé dans ce dossier');
     return;
   }
 
@@ -1194,7 +1226,7 @@ folderInput.addEventListener('change', async () => {
     notionByKey = new Map();
   }
 
-  showToast(`Import de ${traceFiles.length + csvFiles.length} fichier(s)…`, 60000);
+  showToast(`Import de ${traceFiles.length + csvFiles.length + notionPageFiles.length} fichier(s)…`, 60000);
 
   // --- Traces de vol (.kml / .json) ---
   const stamps = await db.getFlightFileStamps();
@@ -1270,10 +1302,43 @@ folderInput.addEventListener('change', async () => {
     }
   }
 
-  if (allRecords.length) {
-    await db.putNotionFlights(allRecords);
-    for (const r of allRecords) notionByKey.set(r.key, r);
+  for (const r of allRecords) notionByKey.set(r.key, r);
+
+  // --- Notes + photos (.html Notion, export "Export as HTML") ---
+  // On enrichit directement les objets déjà dans notionByKey (ceux tout
+  // juste parsés ci-dessus, ou déjà en base depuis un import précédent) :
+  // une page HTML n'a de sens que si sa ligne "Flight History" (CSV) existe
+  // quelque part, ce qui est toujours le cas puisque les deux proviennent du
+  // même export.
+  const filesByRelPath = new Map(allFiles.map((f) => [f.webkitRelativePath || f.name, f]));
+  const touchedKeys = new Set();
+  let notesFound = 0, photosFound = 0;
+
+  for (const file of notionPageFiles) {
+    try {
+      const text = await file.text();
+      const parsed = parseNotionFlightPage(text, file.name);
+      if (!parsed) continue;
+      const record = notionByKey.get(parsed.key);
+      if (!record) continue; // ligne CSV correspondante absente de cet import
+
+      if (parsed.notes) { record.notes = parsed.notes; notesFound++; }
+      if (parsed.photoPaths.length) {
+        const basePath = file.webkitRelativePath || file.name;
+        const photoFile = parsed.photoPaths
+          .map((relPath) => filesByRelPath.get(resolveRelativePath(basePath, relPath)))
+          .find(Boolean);
+        if (photoFile) { record.photoBlob = photoFile; photosFound++; }
+      }
+      touchedKeys.add(parsed.key);
+    } catch (err) {
+      console.error(err);
+    }
   }
+
+  const recordsToPersist = new Map(allRecords.map((r) => [r.key, r]));
+  for (const key of touchedKeys) recordsToPersist.set(key, notionByKey.get(key));
+  if (recordsToPersist.size) await db.putNotionFlights([...recordsToPersist.values()]);
 
   await db.setMeta('lastImport', Date.now());
   const root = allFiles[0]?.webkitRelativePath ? allFiles[0].webkitRelativePath.split('/')[0] : null;
@@ -1286,6 +1351,9 @@ folderInput.addEventListener('change', async () => {
   }
   if (csvFiles.length) {
     summary.push(`${allRecords.length} ligne(s) Notion${csvIgnored ? ' · ' + csvIgnored + ' fichier(s) ignoré(s)' : ''}${csvErrors ? ' · ' + csvErrors + ' erreur(s)' : ''}`);
+  }
+  if (notesFound || photosFound) {
+    summary.push(`${notesFound} note(s) · ${photosFound} photo(s)`);
   }
   showToast(summary.join(' — '));
   render();

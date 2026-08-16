@@ -439,6 +439,26 @@ button.danger { color: var(--danger); }
 .status-pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
 .status-pill.bad { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+.note-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 14px 0;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+.note-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

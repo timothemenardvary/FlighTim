@@ -1,4 +1,4 @@
-const CACHE_NAME = 'flightim-v13';
+const CACHE_NAME = 'flightim-v14';
 const APP_SHELL = [
   './',
   './index.html',
@@ -9,6 +9,7 @@ const APP_SHELL = [
   './js/kmlParser.js',
   './js/flightAwareParser.js',
   './js/notionParser.js',
+  './js/notionHtmlParser.js',
   './js/mapView.js',
   './js/airports.js',
   './js/replay.js',
