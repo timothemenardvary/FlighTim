@@ -6,7 +6,12 @@ export function createMap(container, options = {}) {
     attributionControl: true,
     ...options,
   });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  // Voyager plutôt que Dark Matter : moins "vide et noir", toujours discret
+  // derrière les tracés. Variante "nolabels" : sans elle, les noms de ville
+  // s'accumulent sous les dizaines de routes qui se croisent sur la carte
+  // "Toutes les traces" et rendent le fond illisible — les tracés portent
+  // déjà leur info au survol.
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png', {
     attribution: '&copy; OpenStreetMap &copy; CARTO',
     subdomains: 'abcd',
     maxZoom: 19,

@@ -7,6 +7,7 @@ import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot, c
 import { lookupAirport, continentFor, averageCoordFor } from './airports.js';
 import { WORLD_VIEWBOX, WORLD_LAND_SVG, VISITED_COUNTRY_PATHS, projectLonLat } from './worldGeo.js';
 import { createFlightReplay } from './replay.js';
+import { createFlight3DView } from './flight3d.js';
 
 // pdfjsLib est un global exposé par vendor/pdfjs/pdf.min.js (chargé en
 // <script> classique avant ce module dans index.html, comme Leaflet).
@@ -16,7 +17,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdfjs/pdf.worker.min.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v24';
+const APP_VERSION = 'v28';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -48,7 +49,12 @@ function pickFiles({ directory = false } = {}) {
 let flights = []; // in-memory cache of vols KML, triés desc par date
 let notionByKey = new Map(); // "NUMEROVOL|YYYY-MM-DD" -> ligne Notion, pour enrichir le détail d'un vol
 let mapInstance = null; // tracked so we can .remove() before re-rendering a view with a map
+let flight3dView = null; // vue 3D du profil de vol (fiche de vol), à détruire pour libérer le contexte WebGL
+let flight3dResizeHandler = null; // listener resize de la vue 3D, à retirer en même temps qu'elle est détruite
 let showOrthodromicOnly = true; // carte "Toutes les traces" : inclure les vols sans trace GPS réelle
+let mapFilterA = ''; // carte "Toutes les traces" : premier aéroport du filtre de route ('' = tous)
+let mapFilterB = ''; // second aéroport du filtre de route
+let mapFilterViceVersa = true; // avec les deux aéroports choisis, inclure aussi le sens retour
 let currentReplay = null; // replay en cours sur la page détail, à stopper avant de quitter la vue
 let pendingRefresh = false; // le prochain choix de dossier doit d'abord tout effacer (bouton "Rafraîchir")
 let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
@@ -133,6 +139,14 @@ function destroyMap() {
   if (mapInstance) {
     mapInstance.remove();
     mapInstance = null;
+  }
+  if (flight3dView) {
+    flight3dView.destroy();
+    flight3dView = null;
+  }
+  if (flight3dResizeHandler) {
+    window.removeEventListener('resize', flight3dResizeHandler);
+    flight3dResizeHandler = null;
   }
 }
 
@@ -390,12 +404,13 @@ function render() {
 // ---------- Views ----------
 
 // Texte normalisé (majuscules, sans espaces) dans lequel chercher : numéro de
-// vol, compagnie, et itinéraire écrit "collé" façon "CDGNCE" pour qu'une
+// vol, compagnie, itinéraire écrit "collé" façon "CDGNCE" pour qu'une
 // recherche de ce type matche sans que l'utilisateur ait à connaître le
-// séparateur utilisé à l'affichage.
+// séparateur utilisé à l'affichage, immatriculation et type d'appareil.
 function flightSearchHaystack(f) {
   const route = `${f.depIata || ''}${f.arrIata || ''}`;
-  return [f.flightNumber, f.airline, route].join(' ').toUpperCase();
+  const registration = f.registration || nFor(f)?.registration || '';
+  return [f.flightNumber, f.airline, route, registration, f.aircraftType].join(' ').toUpperCase();
 }
 
 function matchesFlightSearch(f, query) {
@@ -459,7 +474,7 @@ function renderFlightsList() {
   viewRoot.innerHTML = `
     <div class="search-bar">
       <span class="search-icon">&#128269;</span>
-      <input type="search" id="flight-search-input" placeholder="Numéro de vol, compagnie, itinéraire (ex. CDGNCE)…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHtml(flightSearchQuery)}">
+      <input type="search" id="flight-search-input" placeholder="Vol, compagnie, itinéraire (CDGNCE), immat., type d'appareil…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHtml(flightSearchQuery)}">
     </div>
     <div id="flights-list"></div>`;
 
@@ -619,6 +634,7 @@ function renderFlightDetail(id) {
   const co2Tonnes = f.fuelBurnLbs != null ? (f.fuelBurnLbs * 0.453592 * 3.16) / 1000 : null;
 
   const hasRealTrack = !!(f.points && f.points.length >= 2);
+  const hasAltitudeData = hasRealTrack && f.points.some((p) => p.alt != null);
   const depCoord = f.depCoord ?? null; // vols virtuels (Notion-only) uniquement
   const arrCoord = f.arrCoord ?? null;
   const canShowMap = hasRealTrack || (depCoord && arrCoord);
@@ -733,7 +749,13 @@ function renderFlightDetail(id) {
       ${co2Tonnes != null ? `<div class="stat-tile"><div class="label">CO&#8322; estimé</div><div class="value">${co2Tonnes.toLocaleString('fr-FR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} t</div></div>` : ''}
     </div>
 
-    ${(f.points && f.points.length >= 2) ? '<canvas id="alt-chart"></canvas>' : ''}
+    ${hasRealTrack ? '<canvas id="alt-chart"></canvas>' : ''}
+
+    ${hasAltitudeData ? `
+    <div class="flight3d-card">
+      <button type="button" class="secondary" id="flight3d-toggle">&#128200; Vue 3D (altitude)</button>
+      <div class="flight3d-viewer" id="flight3d-viewer" hidden></div>
+    </div>` : ''}
 
     <div class="info-list">
       ${infoRow('Appareil', f.aircraftType)}
@@ -892,38 +914,132 @@ function renderFlightDetail(id) {
     endpointDot(arrCoord, '#f87171').addTo(mapInstance).bindTooltip(f.arrIata || 'Arrivée');
     fitToLayers(mapInstance, [line]);
   }
+
+  if (hasAltitudeData) {
+    const toggleBtn = document.getElementById('flight3d-toggle');
+    const viewer = document.getElementById('flight3d-viewer');
+    toggleBtn.addEventListener('click', () => {
+      const opening = viewer.hidden;
+      viewer.hidden = !opening;
+      toggleBtn.innerHTML = opening ? '&#128200; Masquer la vue 3D' : '&#128200; Vue 3D (altitude)';
+      // Créée à la première ouverture seulement : pas de contexte WebGL payé
+      // pour les vols qu'on ne consulte jamais (Safari en limite le nombre
+      // simultané de toute façon).
+      if (opening && !flight3dView) {
+        flight3dView = createFlight3DView(viewer, f.points);
+        flight3dResizeHandler = () => flight3dView?.resize();
+        window.addEventListener('resize', flight3dResizeHandler);
+      }
+    });
+  }
+}
+
+// Palette catégorielle fixe (jamais recyclée arbitrairement) : les
+// compagnies les plus fréquentes de la sélection affichée obtiennent chacune
+// une couleur stable sur toute la carte, le reste rejoint un panier "Autres"
+// neutre plutôt que de piocher une nouvelle teinte à chaque vol.
+const MAP_CATEGORICAL_COLORS = ['#4da3ff', '#4ade80', '#facc15', '#f472b6', '#a78bfa', '#fb923c'];
+const MAP_OTHER_COLOR = '#8b95a8';
+
+// Un vol passe le filtre de route s'il touche l'aéroport A seul, l'aéroport B
+// seul, ou les deux (dans un sens, et dans l'autre si "vice versa" est actif)
+// — aucun filtre choisi laisse tout passer.
+function passesAirportFilter(f, a, b, viceVersa) {
+  if (!a && !b) return true;
+  if (a && !b) return f.depIata === a || f.arrIata === a;
+  if (!a && b) return f.depIata === b || f.arrIata === b;
+  const direct = f.depIata === a && f.arrIata === b;
+  const reverse = viceVersa && f.depIata === b && f.arrIata === a;
+  return direct || reverse;
 }
 
 function renderAllMap() {
   headerTitle.textContent = 'Toutes les traces';
-  const displayFlights = buildDisplayFlights();
+  const allDisplayFlights = buildDisplayFlights();
+  const airportCodes = [...new Set(allDisplayFlights.flatMap((f) => [f.depIata, f.arrIata]).filter(Boolean))]
+    .sort((x, y) => x.localeCompare(y));
+  const airportOption = (code, selected) => {
+    const a = resolveAirport(code);
+    return `<option value="${escapeHtml(code)}" ${code === selected ? 'selected' : ''}>${escapeHtml(code)}${a ? ' · ' + escapeHtml(a.city) : ''}</option>`;
+  };
+
+  const displayFlights = allDisplayFlights.filter((f) => passesAirportFilter(f, mapFilterA, mapFilterB, mapFilterViceVersa));
   const orthodromicCount = displayFlights.filter((f) => !(f.points && f.points.length >= 2)).length;
 
+  const topAirlines = countBy(displayFlights, (f) => f.airline, { includeUnknown: false })
+    .slice(0, MAP_CATEGORICAL_COLORS.length)
+    .map(([name]) => name);
+  const airlineColor = new Map(topAirlines.map((name, i) => [name, MAP_CATEGORICAL_COLORS[i]]));
+  const colorFor = (f) => (f.airline && airlineColor.get(f.airline)) || MAP_OTHER_COLOR;
+  const hasOther = displayFlights.some((f) => colorFor(f) === MAP_OTHER_COLOR);
+
   viewRoot.innerHTML = `
+    <div class="map-route-filter">
+      <select id="map-filter-a"><option value="">Aéroport A</option>${airportCodes.map((c) => airportOption(c, mapFilterA)).join('')}</select>
+      <span class="map-route-filter-arrow">&#8596;</span>
+      <select id="map-filter-b"><option value="">Aéroport B</option>${airportCodes.map((c) => airportOption(c, mapFilterB)).join('')}</select>
+      ${(mapFilterA || mapFilterB) ? '<button type="button" class="map-route-filter-clear" id="map-filter-clear" aria-label="Réinitialiser le filtre">&times;</button>' : ''}
+    </div>
+    ${(mapFilterA && mapFilterB) ? `
+    <label class="map-filter">
+      <input type="checkbox" id="toggle-viceversa" ${mapFilterViceVersa ? 'checked' : ''} />
+      <span>Inclure le sens retour (${escapeHtml(mapFilterB)} → ${escapeHtml(mapFilterA)})</span>
+    </label>` : ''}
     <label class="map-filter">
       <input type="checkbox" id="toggle-orthodromic" ${showOrthodromicOnly ? 'checked' : ''} ${orthodromicCount ? '' : 'disabled'} />
       <span>Vols sans trace GPS (route orthodromique)${orthodromicCount ? ' · ' + orthodromicCount : ''}</span>
     </label>
-    <div id="all-map"></div>
+    ${topAirlines.length ? `
+    <div class="map-legend">
+      ${topAirlines.map((name) => `<span class="map-legend-chip"><i style="background:${airlineColor.get(name)}"></i>${escapeHtml(name)}</span>`).join('')}
+      ${hasOther ? `<span class="map-legend-chip"><i style="background:${MAP_OTHER_COLOR}"></i>Autres</span>` : ''}
+    </div>` : ''}
+    ${displayFlights.length === 0 ? '<div class="empty-state"><span class="big-emoji">🗺️</span><div>Aucun vol ne correspond à ce filtre.</div></div>' : '<div id="all-map"></div>'}
   `;
 
+  document.getElementById('map-filter-a').addEventListener('change', (e) => {
+    mapFilterA = e.target.value;
+    destroyMap();
+    renderAllMap();
+  });
+  document.getElementById('map-filter-b').addEventListener('change', (e) => {
+    mapFilterB = e.target.value;
+    destroyMap();
+    renderAllMap();
+  });
+  document.getElementById('map-filter-clear')?.addEventListener('click', () => {
+    mapFilterA = '';
+    mapFilterB = '';
+    destroyMap();
+    renderAllMap();
+  });
+  document.getElementById('toggle-viceversa')?.addEventListener('change', (e) => {
+    mapFilterViceVersa = e.target.checked;
+    destroyMap();
+    renderAllMap();
+  });
   document.getElementById('toggle-orthodromic').addEventListener('change', (e) => {
     showOrthodromicOnly = e.target.checked;
     destroyMap();
     renderAllMap();
   });
 
+  if (displayFlights.length === 0) return;
+
   mapInstance = createMap('all-map');
   const layers = [];
-  const palette = ['#4da3ff', '#4ade80', '#facc15', '#f472b6', '#a78bfa', '#fb923c'];
-  displayFlights.forEach((f, i) => {
-    const color = palette[i % palette.length];
+  displayFlights.forEach((f) => {
+    const color = colorFor(f);
+    const tooltip = `${f.flightNumber} · ${f.depIata || '?'} → ${f.arrIata || '?'}`;
     const hasRealTrack = f.points && f.points.length >= 2;
 
     if (hasRealTrack) {
       const latlngs = f.points.map((p) => [p.lat, p.lon]);
-      const line = L.polyline(latlngs, { color, weight: 1.6, opacity: 0.55 }).addTo(mapInstance);
-      line.bindTooltip(`${f.flightNumber} · ${f.depIata || '?'} → ${f.arrIata || '?'}`);
+      // Halo large et très transparent sous le tracé fin, pour un rendu
+      // "traceur de vol" plutôt qu'une ligne Leaflet plate.
+      L.polyline(latlngs, { color, weight: 7, opacity: 0.12, interactive: false }).addTo(mapInstance);
+      const line = L.polyline(latlngs, { color, weight: 1.6, opacity: 0.85 }).addTo(mapInstance);
+      line.bindTooltip(tooltip);
       layers.push(line);
       return;
     }
@@ -932,8 +1048,9 @@ function renderAllMap() {
     const dep = resolveAirport(f.depIata);
     const arr = resolveAirport(f.arrIata);
     if (!dep || !arr) return;
-    const line = drawGreatCircle(mapInstance, dep.lat, dep.lon, arr.lat, arr.lon, color, { weight: 1.6, opacity: 0.55 });
-    line.bindTooltip(`${f.flightNumber} · ${f.depIata || '?'} → ${f.arrIata || '?'} (orthodromique)`);
+    drawGreatCircle(mapInstance, dep.lat, dep.lon, arr.lat, arr.lon, color, { weight: 7, opacity: 0.1, dashArray: null, interactive: false });
+    const line = drawGreatCircle(mapInstance, dep.lat, dep.lon, arr.lat, arr.lon, color, { weight: 1.6, opacity: 0.75 });
+    line.bindTooltip(`${tooltip} (orthodromique)`);
     layers.push(line);
   });
   if (layers.length) fitToLayers(mapInstance, layers, 20);

@@ -43,6 +43,12 @@
 
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/pdfjs/pdf.min.js"></script>
+  <!-- OrbitControls.js (vendor/three/) importe 'three' par son nom nu ;
+       cette import map le résout vers le build vendorisé en local, sans
+       dépendre d'un bundler. -->
+  <script type="importmap">
+  { "imports": { "three": "./vendor/three/three.module.min.js" } }
+  </script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

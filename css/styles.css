@@ -273,6 +273,68 @@ button.danger { color: var(--danger); }
   accent-color: var(--accent);
   flex-shrink: 0;
 }
+
+.map-route-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 2px 0;
+  flex-shrink: 0;
+}
+.map-route-filter select { flex: 1; min-width: 0; }
+.map-route-filter-arrow { color: var(--text-dim); flex-shrink: 0; }
+.map-route-filter-clear {
+  background: var(--bg-card);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 34px;
+  height: 34px;
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 8px 2px 2px;
+  flex-shrink: 0;
+}
+.map-legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.map-legend-chip i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* Reskin des contrôles Leaflet par défaut (blancs, anguleux) pour coller au
+   thème sombre de l'app plutôt que de jurer sur la carte. */
+.leaflet-bar {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.leaflet-bar a,
+.leaflet-bar a:hover,
+.leaflet-bar a:focus {
+  background: var(--bg-card);
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.leaflet-bar a.leaflet-disabled {
+  background: var(--bg-card);
+  color: var(--text-dim);
+}
 .replay-plane-icon svg {
   display: block;
   transform-origin: 50% 50%;
@@ -346,6 +408,19 @@ button.danger { color: var(--danger); }
 
 .flightplan-card { margin-top: 14px; }
 .flightplan-card button.secondary { width: 100%; text-align: left; }
+
+.flight3d-card { margin-top: 14px; }
+.flight3d-card button.secondary { width: 100%; text-align: left; }
+.flight3d-viewer {
+  margin-top: 10px;
+  height: 46vh;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  touch-action: none;
+}
+.flight3d-viewer canvas { display: block; }
 .flightplan-viewer {
   margin-top: 10px;
   border: 1px solid var(--border);

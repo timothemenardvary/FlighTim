@@ -1,4 +1,4 @@
-const CACHE_NAME = 'flightim-v24';
+const CACHE_NAME = 'flightim-v28';
 const APP_SHELL = [
   './',
   './index.html',
@@ -14,10 +14,13 @@ const APP_SHELL = [
   './js/airports.js',
   './js/worldGeo.js',
   './js/replay.js',
+  './js/flight3d.js',
   './vendor/leaflet/leaflet.js',
   './vendor/leaflet/leaflet.css',
   './vendor/pdfjs/pdf.min.js',
   './vendor/pdfjs/pdf.worker.min.js',
+  './vendor/three/three.module.min.js',
+  './vendor/three/OrbitControls.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/apple-touch-icon.png',
