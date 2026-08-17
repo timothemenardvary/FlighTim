@@ -1,4 +1,4 @@
-const CACHE_NAME = 'flightim-v21';
+const CACHE_NAME = 'flightim-v22';
 const APP_SHELL = [
   './',
   './index.html',
@@ -51,15 +51,17 @@ self.addEventListener('fetch', (event) => {
 
   if (event.request.method !== 'GET' || url.origin !== location.origin) return;
 
+  // Réseau d'abord pour l'app shell : avec la stratégie "cache d'abord"
+  // précédente, un simple rechargement ne montrait jamais la dernière
+  // version au premier essai (le réseau ne servait qu'à rafraîchir le cache
+  // pour LA FOIS SUIVANTE) — ce qui rendait "Recharger l'app" inefficace en
+  // pratique. Le cache ne sert plus que de repli hors-ligne.
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const network = fetch(event.request)
-        .then((res) => {
-          if (res.ok) caches.open(CACHE_NAME).then((c) => c.put(event.request, res.clone()));
-          return res;
-        })
-        .catch(() => cached);
-      return cached || network;
-    })
+    fetch(event.request)
+      .then((res) => {
+        if (res.ok) caches.open(CACHE_NAME).then((c) => c.put(event.request, res.clone()));
+        return res;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

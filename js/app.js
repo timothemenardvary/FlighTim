@@ -12,7 +12,7 @@ import { createFlightReplay } from './replay.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v21';
+const APP_VERSION = 'v22';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -1402,16 +1402,20 @@ async function renderSettings() {
   `;
 
   document.getElementById('reload-app-btn').addEventListener('click', async () => {
-    // Utile en mode standalone (icône écran d'accueil) : pas de barre d'adresse
-    // ni de bouton "recharger" natif si l'app se fige. On relance aussi une
-    // vérification de mise à jour du service worker au passage, pour ne pas
-    // rester bloqué sur une version mise en cache si une plus récente a été
-    // déployée entre-temps.
+    // Utile en mode standalone (icône écran d'accueil) : pas de barre
+    // d'adresse ni de bouton "recharger" natif si l'app se fige. On
+    // désinscrit le service worker et on vide tous les caches avant de
+    // recharger — un simple reg.update() + reload() n'offrait aucune
+    // garantie sur le moment où la nouvelle version prend effectivement le
+    // relais, ce qui pouvait laisser l'appareil bloqué sur une vieille
+    // version malgré le bouton.
     try {
-      const reg = await navigator.serviceWorker?.getRegistration();
-      await reg?.update();
+      const regs = (await navigator.serviceWorker?.getRegistrations?.()) ?? [];
+      await Promise.all(regs.map((r) => r.unregister()));
+      const keys = (await window.caches?.keys?.()) ?? [];
+      await Promise.all(keys.map((k) => caches.delete(k)));
     } catch (err) {
-      console.warn('SW update check failed', err);
+      console.warn('Reset avant rechargement échoué', err);
     }
     location.reload();
   });
