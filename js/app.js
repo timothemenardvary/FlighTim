@@ -12,7 +12,7 @@ import { createFlightReplay } from './replay.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v22';
+const APP_VERSION = 'v23';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -746,7 +746,12 @@ function renderFlightDetail(id) {
       // jamais.
       if (opening && !frame.src) {
         flightPlanObjectUrl = URL.createObjectURL(flightPlanBlob);
-        frame.src = flightPlanObjectUrl;
+        // #view=FitH (paramètre PDF Open standard, supporté par le
+        // visualiseur PDF de WebKit) : sans ça, le visualiseur PDF intégré
+        // d'iOS affiche parfois la page à sa largeur native au lieu de
+        // l'ajuster à l'iframe, ce qui force un défilement horizontal et
+        // perturbe la navigation entre pages.
+        frame.src = flightPlanObjectUrl + '#view=FitH';
       }
     });
   }
