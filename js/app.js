@@ -17,7 +17,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdfjs/pdf.worker.min.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v28';
+const APP_VERSION = 'v31';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -60,6 +60,7 @@ let pendingRefresh = false; // le prochain choix de dossier doit d'abord tout ef
 let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
 let statsYear = 'all'; // filtre année partagé par les deux sous-vues de la page Stats
 let selectedAirport = null; // aéroport choisi dans le détail de la page Stats > Aéroports
+let selectedRoute = null; // route (paire d'aéroports, sens confondu) choisie dans Stats > Routes
 let flightSearchQuery = ''; // texte de la barre de recherche, page Liste des vols
 let flightPhotoObjectUrls = []; // URLs blob de la galerie photo perso affichée sur le détail de vol, à révoquer au prochain rendu
 let flightPlanObjectUrl = null; // URL blob du PDF plan de vol affiché sur le détail de vol, à révoquer au prochain rendu
@@ -148,6 +149,15 @@ function destroyMap() {
     window.removeEventListener('resize', flight3dResizeHandler);
     flight3dResizeHandler = null;
   }
+  // URLs blob de galerie(s) photo (fiche de vol, ou fiches avion/compagnie/
+  // type qui agrègent les photos de plusieurs vols) : révoquées ici, avant
+  // toute vue, plutôt que dans chaque fonction de rendu individuellement.
+  flightPhotoObjectUrls.forEach((u) => URL.revokeObjectURL(u));
+  flightPhotoObjectUrls = [];
+  if (flightPlanObjectUrl) { URL.revokeObjectURL(flightPlanObjectUrl); flightPlanObjectUrl = null; }
+  if (flightPlanDoc) { flightPlanDoc.destroy(); flightPlanDoc = null; }
+  if (flightPlanResizeHandler) { window.removeEventListener('resize', flightPlanResizeHandler); flightPlanResizeHandler = null; }
+  flightPlanPage = 1;
 }
 
 function showToast(msg, ms = 3200) {
@@ -390,6 +400,12 @@ function render() {
   } else if (route.startsWith('#/aircraft/')) {
     const registration = decodeURIComponent(route.slice('#/aircraft/'.length));
     renderAircraftDetail(registration);
+  } else if (route.startsWith('#/airline/')) {
+    const code = decodeURIComponent(route.slice('#/airline/'.length));
+    renderAirlineDetail(code);
+  } else if (route.startsWith('#/aircraft-type/')) {
+    const type = decodeURIComponent(route.slice('#/aircraft-type/'.length));
+    renderAircraftTypeDetail(type);
   } else if (route === '#/map') {
     renderAllMap();
   } else if (route === '#/stats') {
@@ -560,15 +576,6 @@ function setupAltitudeChart(canvas, points) {
 }
 
 function renderFlightDetail(id) {
-  // Révoque les URLs blob de la galerie photo du rendu précédent (page
-  // quittée ou vol différent) avant d'en créer éventuellement de nouvelles.
-  flightPhotoObjectUrls.forEach((u) => URL.revokeObjectURL(u));
-  flightPhotoObjectUrls = [];
-  if (flightPlanObjectUrl) { URL.revokeObjectURL(flightPlanObjectUrl); flightPlanObjectUrl = null; }
-  if (flightPlanDoc) { flightPlanDoc.destroy(); flightPlanDoc = null; }
-  if (flightPlanResizeHandler) { window.removeEventListener('resize', flightPlanResizeHandler); flightPlanResizeHandler = null; }
-  flightPlanPage = 1;
-
   const f = buildDisplayFlights().find((x) => x.id === id);
   headerTitle.textContent = f ? f.flightNumber : 'Vol';
 
@@ -672,7 +679,7 @@ function renderFlightDetail(id) {
         ${heroTimes}
       </div>
       <div class="hero-middle">
-        <div class="hero-flightnum">${escapeHtml(f.flightNumber)}${f.airline ? ' · ' + escapeHtml(f.airline) : ''}</div>
+        <div class="hero-flightnum">${escapeHtml(f.flightNumber)}${f.airline ? ' · <a class="info-link" href="#/airline/' + encodeURIComponent(f.airline) + '">' + escapeHtml(f.airline) + '</a>' : ''}</div>
         <div class="hero-line"><span class="dot"></span><span class="line"></span><span class="plane">&#9992;</span><span class="line"></span><span class="dot"></span></div>
         <div class="hero-duration">${duration || '—'}</div>
       </div>
@@ -758,7 +765,7 @@ function renderFlightDetail(id) {
     </div>` : ''}
 
     <div class="info-list">
-      ${infoRow('Appareil', f.aircraftType)}
+      ${f.aircraftType ? infoRowLink('Appareil', f.aircraftType, '#/aircraft-type/' + encodeURIComponent(f.aircraftType)) : infoRow('Appareil', f.aircraftType)}
       ${registration ? infoRowLink('Immatriculation', registration, '#/aircraft/' + encodeURIComponent(registration)) : ''}
       ${infoRow('Indicatif', f.callsign)}
       ${infoRow('Cabine', n?.cabin)}
@@ -1091,6 +1098,36 @@ function avgByGroup(items, keyFn, valueFn) {
   return [...sums.entries()].map(([k, { sum, n }]) => [k, sum / n]).sort((a, b) => b[1] - a[1]);
 }
 
+// Histogramme de répartition des retards (arrivée, repli départ) par
+// tranche — contrairement à countBy(), l'ordre des tranches (croissant) est
+// fixe, pas trié par fréquence : c'est ce qui fait qu'on lit une
+// distribution plutôt qu'un classement. Les tranches vides restent visibles
+// (barre à 0) pour ne pas déformer la forme de la distribution.
+const DELAY_BUCKETS = [
+  ['< -15 min', (m) => m < -15, 'good'],
+  ['-15 à -5 min', (m) => m >= -15 && m < -5, 'good'],
+  ['-5 à 5 min (à l’heure)', (m) => m >= -5 && m <= 5, 'good'],
+  ['5 à 15 min', (m) => m > 5 && m <= 15, 'warn'],
+  ['15 à 30 min', (m) => m > 15 && m <= 30, 'warn'],
+  ['30 à 60 min', (m) => m > 30 && m <= 60, 'bad'],
+  ['> 60 min', (m) => m > 60, 'bad'],
+];
+const DELAY_BUCKET_COLOR = { good: 'var(--accent-2)', warn: 'var(--warn)', bad: 'var(--danger)' };
+
+function delayHistogram(flights) {
+  const counts = new Array(DELAY_BUCKETS.length).fill(0);
+  for (const f of flights) {
+    const { depDelayMin, arrDelayMin } = flightDelays(f);
+    const min = arrDelayMin ?? depDelayMin;
+    if (min == null) continue;
+    const idx = DELAY_BUCKETS.findIndex(([, test]) => test(min));
+    if (idx >= 0) counts[idx]++;
+  }
+  const rows = DELAY_BUCKETS.map(([label], i) => [label, counts[i]]);
+  const colorByLabel = new Map(DELAY_BUCKETS.map(([label, , cls]) => [label, DELAY_BUCKET_COLOR[cls]]));
+  return { rows, colorFor: (value, label) => colorByLabel.get(label) || 'var(--accent)' };
+}
+
 // Couleur de statut (bonne/moyenne/mauvaise) reprise du vocabulaire retard
 // déjà utilisé partout ailleurs dans l'app — jamais une teinte catégorielle
 // arbitraire, toujours la même sémantique good/warn/bad.
@@ -1111,7 +1148,7 @@ function barChartHtml(rows, { formatValue, colorFor, limit, rowHref } = {}) {
   const maxVal = Math.max(...rows.map(([, v]) => Math.abs(v)), 1);
   const renderRow = ([label, value]) => {
     const pct = Math.min(100, (Math.abs(value) / maxVal) * 100);
-    const color = colorFor ? colorFor(value) : 'var(--accent)';
+    const color = colorFor ? colorFor(value, label) : 'var(--accent)';
     const valueStr = formatValue ? formatValue(value) : String(value);
     const href = rowHref ? rowHref(label) : null;
     const tag = href ? 'a' : 'div';
@@ -1179,6 +1216,7 @@ function renderStats() {
       <div class="segmented" id="stats-tabs">
         <button type="button" data-view="flights" class="${statsSubView === 'flights' ? 'active' : ''}">Vols</button>
         <button type="button" data-view="airports" class="${statsSubView === 'airports' ? 'active' : ''}">Aéroports</button>
+        <button type="button" data-view="routes" class="${statsSubView === 'routes' ? 'active' : ''}">Routes</button>
         <button type="button" data-view="world" class="${statsSubView === 'world' ? 'active' : ''}">Monde</button>
       </div>
       <select id="stats-year">
@@ -1207,6 +1245,7 @@ function renderStats() {
     return;
   }
   if (statsSubView === 'airports') renderAirportStats(content, flights);
+  else if (statsSubView === 'routes') renderRouteStats(content, flights);
   else if (statsSubView === 'world') renderWorldStats(content, flights);
   else renderFlightStats(content, flights);
 }
@@ -1256,7 +1295,7 @@ function renderMilestones(flights) {
       <div class="stat-grid">
         <div class="stat-tile"><div class="label">Pays visités</div><div class="value">${countries.size}</div></div>
         <div class="stat-tile"><div class="label">Continents visités</div><div class="value">${continents.size}</div></div>
-        ${topAircraftType ? `<div class="stat-tile"><div class="label">Appareil favori</div><div class="value">${escapeHtml(topAircraftType)}</div><div class="label">${topAircraftCount} vol(s)</div></div>` : ''}
+        ${topAircraftType ? `<a class="stat-tile" href="#/aircraft-type/${encodeURIComponent(topAircraftType)}"><div class="label">Appareil favori</div><div class="value">${escapeHtml(topAircraftType)}</div><div class="label">${topAircraftCount} vol(s)</div></a>` : ''}
         ${routeTile(longest, 'Vol le plus long')}
         ${routeTile(shortest, 'Vol le plus court')}
       </div>
@@ -1277,6 +1316,7 @@ function renderFlightStats(content, flights) {
   });
   const byAircraftType = countBy(flights, (f) => f.aircraftType);
   const byRegistration = countBy(flights, (f) => f.registration || nFor(f)?.registration);
+  const histo = delayHistogram(flights);
 
   content.innerHTML = `
     <div class="stat-grid">
@@ -1287,18 +1327,23 @@ function renderFlightStats(content, flights) {
     ${renderMilestones(flights)}
 
     <div class="chart-card">
+      <h3>Répartition des retards (arrivée)</h3>
+      ${barChartHtml(histo.rows, { colorFor: histo.colorFor })}
+    </div>
+
+    <div class="chart-card">
       <h3>Retard moyen (arrivée) par compagnie</h3>
-      ${barChartHtml(delayByAirline, { formatValue: fmtSignedDelay, colorFor: delayBarColor })}
+      ${barChartHtml(delayByAirline, { formatValue: fmtSignedDelay, colorFor: delayBarColor, rowHref: (name) => name === 'Inconnu(e)' ? null : '#/airline/' + encodeURIComponent(name) })}
     </div>
 
     <div class="chart-card">
       <h3>Vols par compagnie</h3>
-      ${barChartHtml(byAirline)}
+      ${barChartHtml(byAirline, { rowHref: (name) => name === 'Inconnu(e)' ? null : '#/airline/' + encodeURIComponent(name) })}
     </div>
 
     <div class="chart-card">
       <h3>Vols par type d'avion</h3>
-      ${barChartHtml(byAircraftType)}
+      ${barChartHtml(byAircraftType, { rowHref: (type) => type === 'Inconnu(e)' ? null : '#/aircraft-type/' + encodeURIComponent(type) })}
     </div>
 
     <div class="chart-card">
@@ -1399,6 +1444,107 @@ function renderAirportDetail(el, { dep, arr }, code) {
   wireBarChartToggles(el);
 }
 
+// Route = paire d'aéroports, sens confondu (CDG->NCE et NCE->CDG comptent
+// pour la même route) : c'est ainsi qu'on pense naturellement "ma route
+// Paris-Nice", cohérent avec le "sens retour" du filtre carte.
+function routeKeyFor(f) {
+  if (!f.depIata || !f.arrIata) return null;
+  return [f.depIata, f.arrIata].sort().join(' ↔ ');
+}
+
+function renderRouteStats(content, flights) {
+  const idx = new Map(); // routeKey -> flights[]
+  for (const f of flights) {
+    const key = routeKeyFor(f);
+    if (!key) continue;
+    if (!idx.has(key)) idx.set(key, []);
+    idx.get(key).push(f);
+  }
+
+  const totals = [...idx.entries()]
+    .map(([key, fs]) => [key, fs.length])
+    .sort((a, b) => b[1] - a[1]);
+
+  if (!selectedRoute || !idx.has(selectedRoute)) {
+    selectedRoute = totals.length ? totals[0][0] : null;
+  }
+
+  const routeOptions = totals
+    .map(([key]) => `<option value="${escapeHtml(key)}" ${key === selectedRoute ? 'selected' : ''}>${escapeHtml(key)} (${idx.get(key).length})</option>`)
+    .join('');
+
+  content.innerHTML = `
+    <div class="chart-card">
+      <h3>Vols par route</h3>
+      ${barChartHtml(totals, { limit: 15 })}
+    </div>
+
+    ${selectedRoute ? `
+    <div class="airport-picker">
+      <label class="k" for="route-select">Détail par route</label>
+      <select id="route-select">${routeOptions}</select>
+    </div>
+    <div id="route-detail"></div>
+    ` : ''}
+  `;
+  wireBarChartToggles(content);
+
+  if (selectedRoute) {
+    document.getElementById('route-select').addEventListener('change', (e) => {
+      selectedRoute = e.target.value;
+      renderRouteStats(content, flights);
+    });
+    renderRouteDetail(document.getElementById('route-detail'), idx.get(selectedRoute), selectedRoute);
+  }
+}
+
+function renderRouteDetail(el, routeFlights, key) {
+  const durations = routeFlights
+    .filter((f) => f.startTime && f.endTime)
+    .map((f) => (new Date(f.endTime) - new Date(f.startTime)) / 60000)
+    .filter((min) => isFinite(min) && min > 0);
+  const avgDurationMin = durations.length ? durations.reduce((s, v) => s + v, 0) / durations.length : null;
+
+  const delays = routeFlights
+    .map((f) => {
+      const { depDelayMin, arrDelayMin } = flightDelays(f);
+      return arrDelayMin ?? depDelayMin;
+    })
+    .filter((v) => v != null);
+  const avgDelayMin = delays.length ? delays.reduce((s, v) => s + v, 0) / delays.length : null;
+  const avgDelayInfo = avgDelayMin != null ? delayInfo(avgDelayMin, { arrival: true }) : null;
+
+  const distances = routeFlights.map((f) => f.distanceKm).filter((v) => v != null);
+  const avgDistanceKm = distances.length ? Math.round(distances.reduce((s, v) => s + v, 0) / distances.length) : null;
+
+  const byAirline = countBy(routeFlights, (f) => f.airline, { includeUnknown: false });
+  const byAircraftType = countBy(routeFlights, (f) => f.aircraftType, { includeUnknown: false });
+
+  el.innerHTML = `
+    <div class="airport-title">${escapeHtml(key)}</div>
+
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="label">Vols</div><div class="value">${routeFlights.length}</div></div>
+      <div class="stat-tile"><div class="label">Retard moyen</div><div class="value${avgDelayInfo ? ' ' + avgDelayInfo.cls : ''}">${avgDelayMin != null ? fmtSignedDelay(avgDelayMin) : '—'}</div></div>
+      <div class="stat-tile"><div class="label">Temps de vol moyen</div><div class="value">${avgDurationMin != null ? fmtTotalHours(avgDurationMin) : '—'}</div></div>
+      <div class="stat-tile"><div class="label">Distance</div><div class="value">${avgDistanceKm != null ? avgDistanceKm + ' km' : '—'}</div></div>
+    </div>
+
+    <div class="chart-card">
+      <h3>Compagnies</h3>
+      ${barChartHtml(byAirline, { rowHref: (name) => '#/airline/' + encodeURIComponent(name) })}
+    </div>
+    <div class="chart-card">
+      <h3>Types d'avion</h3>
+      ${barChartHtml(byAircraftType, { rowHref: (type) => '#/aircraft-type/' + encodeURIComponent(type) })}
+    </div>
+
+    ${flightListHtml([...routeFlights].sort(flightSortCompare))}
+  `;
+  wireBarChartToggles(el);
+  wireFlightCards(el);
+}
+
 const CONTINENT_ORDER = ['Europe', 'Amérique du Nord', 'Amérique du Sud', 'Asie', 'Afrique', 'Océanie', 'Autre'];
 
 // Atlas de vol : carte du monde avec les pays traversés (départ/arrivée) par
@@ -1472,31 +1618,37 @@ function renderWorldStats(content, flights) {
   });
 }
 
-// Fiche avion : accessible depuis une immatriculation cliquée n'importe où
-// dans l'app (détail de vol, stats). Regroupe tous les vols enregistrés pour
-// cette immatriculation, toutes sources confondues (KML/JSON + Notion).
-function renderAircraftDetail(registration) {
-  const norm = (registration || '').trim();
-  headerTitle.textContent = norm || 'Avion';
+// Fiche générique "tous les vols associés à X" (immatriculation, compagnie,
+// type d'avion...) — accessible depuis une valeur cliquée n'importe où dans
+// l'app (détail de vol, stats, graphiques). `matched` doit déjà être trié
+// (le plus récent en premier).
+function renderFlightGroupPage(title, subtitle, matched, notFoundLabel) {
+  headerTitle.textContent = title || notFoundLabel;
 
-  const matched = buildDisplayFlights()
-    .filter((f) => ((f.registration || nFor(f)?.registration || '').trim()) === norm)
-    .sort(flightSortCompare); // plus récent en premier
-
-  if (!norm || matched.length === 0) {
-    viewRoot.innerHTML = `<button class="back-btn" id="back-btn">&#8249; Retour</button><div class="empty-state">Avion introuvable.</div>`;
+  if (!title || matched.length === 0) {
+    viewRoot.innerHTML = `<button class="back-btn" id="back-btn">&#8249; Retour</button><div class="empty-state">${escapeHtml(notFoundLabel)}</div>`;
     document.getElementById('back-btn').addEventListener('click', () => history.back());
     return;
   }
 
-  const aircraftType = matched.map((f) => f.aircraftType).find((t) => t) || null;
   const firstFlight = matched[matched.length - 1];
   const lastFlight = matched[0];
 
+  // Photos perso (Notion) de tous les vols du groupe, chaque miniature
+  // ramenant vers son vol d'origine — la photo générique FlightAware n'a
+  // pas de sens ici, agrégée elle ne représenterait qu'un appareil, pas un
+  // souvenir de vol précis.
+  const photoEntries = [];
+  for (const f of matched) {
+    const n = nFor(f);
+    const blobs = n?.photoBlobs?.length ? n.photoBlobs : (n?.photoBlob ? [n.photoBlob] : []);
+    for (const blob of blobs) photoEntries.push({ blob, flightId: f.id });
+  }
+
   viewRoot.innerHTML = `
     <button class="back-btn" id="back-btn">&#8249; Retour</button>
-    <div class="airport-title">${escapeHtml(norm)}</div>
-    <div class="airport-sub">${aircraftType ? escapeHtml(aircraftType) : "Type d'avion inconnu"}</div>
+    <div class="airport-title">${escapeHtml(title)}</div>
+    ${subtitle ? `<div class="airport-sub">${escapeHtml(subtitle)}</div>` : ''}
 
     <div class="stat-grid">
       <div class="stat-tile"><div class="label">Vols</div><div class="value">${matched.length}</div></div>
@@ -1504,14 +1656,64 @@ function renderAircraftDetail(registration) {
       <div class="stat-tile"><div class="label">Dernier vol</div><div class="value">${lastFlight.date ? fmtDate(lastFlight.date) : '—'}</div></div>
     </div>
 
-    <div id="aircraft-flights"></div>
+    ${photoEntries.length ? `
+    <div class="chart-card">
+      <h3>Photos (${photoEntries.length})</h3>
+      <div class="group-photo-grid" id="group-photo-grid">
+        ${photoEntries.map((entry, i) => `<a href="#/flight/${encodeURIComponent(entry.flightId)}"><img data-idx="${i}" loading="lazy" alt="Photo de vol"/></a>`).join('')}
+      </div>
+    </div>` : ''}
+
+    <div id="group-flights"></div>
   `;
 
   document.getElementById('back-btn').addEventListener('click', () => history.back());
 
-  const listEl = document.getElementById('aircraft-flights');
+  if (photoEntries.length) {
+    document.querySelectorAll('#group-photo-grid img').forEach((img) => {
+      const url = URL.createObjectURL(photoEntries[Number(img.dataset.idx)].blob);
+      flightPhotoObjectUrls.push(url);
+      img.src = url;
+    });
+  }
+
+  const listEl = document.getElementById('group-flights');
   listEl.innerHTML = flightListHtml(matched);
   wireFlightCards(listEl);
+}
+
+// Fiche avion : accessible depuis une immatriculation cliquée n'importe où
+// dans l'app (détail de vol, stats). Regroupe tous les vols enregistrés pour
+// cette immatriculation, toutes sources confondues (KML/JSON + Notion).
+function renderAircraftDetail(registration) {
+  const norm = (registration || '').trim();
+  const matched = buildDisplayFlights()
+    .filter((f) => ((f.registration || nFor(f)?.registration || '').trim()) === norm)
+    .sort(flightSortCompare); // plus récent en premier
+  const aircraftType = matched.map((f) => f.aircraftType).find((t) => t) || null;
+  renderFlightGroupPage(norm, aircraftType || "Type d'avion inconnu", matched, 'Avion introuvable.');
+}
+
+// Fiche compagnie : accessible depuis une compagnie cliquée n'importe où
+// dans l'app. Le champ compagnie n'est pas normalisé entre sources (code
+// IATA type "AF" depuis un KML, nom complet type "Air France" depuis un
+// JSON FlightAware) — on matche donc tel quel, comme les stats existantes.
+function renderAirlineDetail(airline) {
+  const norm = (airline || '').trim();
+  const matched = buildDisplayFlights()
+    .filter((f) => (f.airline || '').trim() === norm)
+    .sort(flightSortCompare);
+  renderFlightGroupPage(norm, null, matched, 'Compagnie introuvable.');
+}
+
+// Fiche type d'avion : accessible depuis un type cliqué n'importe où dans
+// l'app.
+function renderAircraftTypeDetail(aircraftType) {
+  const norm = (aircraftType || '').trim();
+  const matched = buildDisplayFlights()
+    .filter((f) => (f.aircraftType || '').trim() === norm)
+    .sort(flightSortCompare);
+  renderFlightGroupPage(norm, null, matched, "Type d'avion introuvable.");
 }
 
 async function renderSettings() {

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'flightim-v28';
+const CACHE_NAME = 'flightim-v31';
 const APP_SHELL = [
   './',
   './index.html',
