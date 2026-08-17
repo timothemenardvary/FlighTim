@@ -8,11 +8,15 @@ import { lookupAirport, continentFor, averageCoordFor } from './airports.js';
 import { WORLD_VIEWBOX, WORLD_LAND_SVG, VISITED_COUNTRY_PATHS, projectLonLat } from './worldGeo.js';
 import { createFlightReplay } from './replay.js';
 
+// pdfjsLib est un global exposé par vendor/pdfjs/pdf.min.js (chargé en
+// <script> classique avant ce module dans index.html, comme Leaflet).
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdfjs/pdf.worker.min.js';
+
 // Affichée en bas de Réglages pour vérifier qu'un appareil a bien rechargé
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v23';
+const APP_VERSION = 'v24';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -53,6 +57,9 @@ let selectedAirport = null; // aéroport choisi dans le détail de la page Stats
 let flightSearchQuery = ''; // texte de la barre de recherche, page Liste des vols
 let flightPhotoObjectUrls = []; // URLs blob de la galerie photo perso affichée sur le détail de vol, à révoquer au prochain rendu
 let flightPlanObjectUrl = null; // URL blob du PDF plan de vol affiché sur le détail de vol, à révoquer au prochain rendu
+let flightPlanDoc = null; // document pdf.js chargé pour le plan de vol affiché, à détruire au prochain rendu
+let flightPlanPage = 1; // page actuellement affichée du plan de vol
+let flightPlanResizeHandler = null; // listener resize (réajuste la page au redimensionnement/rotation), à retirer au prochain rendu
 
 function notionKeyFor(flight) {
   return `${(flight.flightNumber || '').toUpperCase()}|${flight.date || ''}`;
@@ -543,6 +550,9 @@ function renderFlightDetail(id) {
   flightPhotoObjectUrls.forEach((u) => URL.revokeObjectURL(u));
   flightPhotoObjectUrls = [];
   if (flightPlanObjectUrl) { URL.revokeObjectURL(flightPlanObjectUrl); flightPlanObjectUrl = null; }
+  if (flightPlanDoc) { flightPlanDoc.destroy(); flightPlanDoc = null; }
+  if (flightPlanResizeHandler) { window.removeEventListener('resize', flightPlanResizeHandler); flightPlanResizeHandler = null; }
+  flightPlanPage = 1;
 
   const f = buildDisplayFlights().find((x) => x.id === id);
   headerTitle.textContent = f ? f.flightNumber : 'Vol';
@@ -684,7 +694,14 @@ function renderFlightDetail(id) {
     <div class="flightplan-card">
       <button type="button" class="secondary" id="flightplan-toggle">&#128196; Plan de vol${n.flightPlanName ? ' · ' + escapeHtml(n.flightPlanName) : ''}</button>
       <div class="flightplan-viewer" id="flightplan-viewer" hidden>
-        <iframe id="flightplan-frame" title="Plan de vol"></iframe>
+        <div class="flightplan-pager">
+          <button type="button" id="flightplan-prev" aria-label="Page précédente" disabled>&#8249;</button>
+          <span class="flightplan-page-info" id="flightplan-page-info">Chargement…</span>
+          <button type="button" id="flightplan-next" aria-label="Page suivante" disabled>&#8250;</button>
+        </div>
+        <div class="flightplan-canvas-wrap" id="flightplan-canvas-wrap">
+          <canvas id="flightplan-canvas"></canvas>
+        </div>
       </div>
     </div>` : ''}
 
@@ -735,23 +752,58 @@ function renderFlightDetail(id) {
   if (flightPlanBlob) {
     const toggleBtn = document.getElementById('flightplan-toggle');
     const viewer = document.getElementById('flightplan-viewer');
-    const frame = document.getElementById('flightplan-frame');
+    const prevBtn = document.getElementById('flightplan-prev');
+    const nextBtn = document.getElementById('flightplan-next');
+    const pageInfo = document.getElementById('flightplan-page-info');
+    const canvas = document.getElementById('flightplan-canvas');
     const label = `Plan de vol${n.flightPlanName ? ' · ' + escapeHtml(n.flightPlanName) : ''}`;
-    toggleBtn.addEventListener('click', () => {
+
+    // Rendu canvas via pdf.js plutôt qu'un <iframe>/visualiseur PDF natif :
+    // sur iOS, ce dernier ignore le fit-to-width et ne propose aucune
+    // pagination fiable dans une iframe imbriquée — le rendu maison se
+    // comporte pareil sur toutes les plateformes.
+    const renderPage = async () => {
+      const page = await flightPlanDoc.getPage(flightPlanPage);
+      const wrapWidth = document.getElementById('flightplan-canvas-wrap').clientWidth;
+      const unscaled = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: wrapWidth / unscaled.width });
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(viewport.width * dpr);
+      canvas.height = Math.round(viewport.height * dpr);
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      pageInfo.textContent = `${flightPlanPage} / ${flightPlanDoc.numPages}`;
+      prevBtn.disabled = flightPlanPage <= 1;
+      nextBtn.disabled = flightPlanPage >= flightPlanDoc.numPages;
+    };
+
+    prevBtn.addEventListener('click', () => {
+      if (flightPlanPage > 1) { flightPlanPage--; renderPage(); }
+    });
+    nextBtn.addEventListener('click', () => {
+      if (flightPlanDoc && flightPlanPage < flightPlanDoc.numPages) { flightPlanPage++; renderPage(); }
+    });
+    flightPlanResizeHandler = () => { if (!viewer.hidden && flightPlanDoc) renderPage(); };
+    window.addEventListener('resize', flightPlanResizeHandler);
+
+    toggleBtn.addEventListener('click', async () => {
       const opening = viewer.hidden;
       viewer.hidden = !opening;
       toggleBtn.innerHTML = opening ? '&#128196; Masquer le plan de vol' : `&#128196; ${label}`;
-      // Le blob PDF n'est chargé dans l'iframe qu'à la première ouverture,
-      // pas au rendu de la page : pas de coût pour les vols qu'on ne consulte
-      // jamais.
-      if (opening && !frame.src) {
-        flightPlanObjectUrl = URL.createObjectURL(flightPlanBlob);
-        // #view=FitH (paramètre PDF Open standard, supporté par le
-        // visualiseur PDF de WebKit) : sans ça, le visualiseur PDF intégré
-        // d'iOS affiche parfois la page à sa largeur native au lieu de
-        // l'ajuster à l'iframe, ce qui force un défilement horizontal et
-        // perturbe la navigation entre pages.
-        frame.src = flightPlanObjectUrl + '#view=FitH';
+      // Le PDF n'est chargé qu'à la première ouverture, pas au rendu de la
+      // page : pas de coût pour les vols qu'on ne consulte jamais.
+      if (opening && !flightPlanDoc) {
+        try {
+          flightPlanObjectUrl = URL.createObjectURL(flightPlanBlob);
+          flightPlanDoc = await pdfjsLib.getDocument(flightPlanObjectUrl).promise;
+          await renderPage();
+        } catch (err) {
+          console.error(err);
+          pageInfo.textContent = 'Impossible d\'afficher ce PDF';
+        }
       }
     });
   }
