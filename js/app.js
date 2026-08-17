@@ -4,7 +4,7 @@ import { parseNotionCSV } from './notionParser.js';
 import { parseNotionFlightPage, resolveRelativePath } from './notionHtmlParser.js';
 import * as db from './db.js';
 import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot, createPlaneMarker } from './mapView.js';
-import { lookupAirport } from './airports.js';
+import { lookupAirport, continentFor } from './airports.js';
 import { createFlightReplay } from './replay.js';
 
 const viewRoot = document.getElementById('view-root');
@@ -936,6 +936,50 @@ function renderStats() {
   else renderFlightStats(content, flights);
 }
 
+// Jalons perso (pays/continents visités, appareil favori, vol le plus
+// long/court) : tout est déjà dérivable des vols affichés + du référentiel
+// aéroports, aucune donnée supplémentaire à importer.
+function renderMilestones(flights) {
+  const countries = new Set();
+  const continents = new Set();
+  for (const f of flights) {
+    for (const iata of [f.depIata, f.arrIata]) {
+      const country = resolveAirport(iata)?.country;
+      if (!country) continue;
+      countries.add(country);
+      const continent = continentFor(country);
+      if (continent) continents.add(continent);
+    }
+  }
+
+  const [topAircraftType, topAircraftCount] = countBy(flights, (f) => f.aircraftType, { includeUnknown: false })[0] || [];
+
+  let longest = null, shortest = null;
+  for (const f of flights) {
+    if (f.distanceKm == null) continue;
+    if (!longest || f.distanceKm > longest.distanceKm) longest = f;
+    if (!shortest || f.distanceKm < shortest.distanceKm) shortest = f;
+  }
+  const routeTile = (f, label) => f ? `
+    <a class="stat-tile" href="#/flight/${encodeURIComponent(f.id)}">
+      <div class="label">${label}</div>
+      <div class="value">${escapeHtml(f.depIata || '???')} → ${escapeHtml(f.arrIata || '???')}</div>
+      <div class="label">${f.distanceKm.toLocaleString('fr-FR')} km</div>
+    </a>` : '';
+
+  return `
+    <div class="chart-card">
+      <h3>Repères</h3>
+      <div class="stat-grid">
+        <div class="stat-tile"><div class="label">Pays visités</div><div class="value">${countries.size}</div></div>
+        <div class="stat-tile"><div class="label">Continents visités</div><div class="value">${continents.size}</div></div>
+        ${topAircraftType ? `<div class="stat-tile"><div class="label">Appareil favori</div><div class="value">${escapeHtml(topAircraftType)}</div><div class="label">${topAircraftCount} vol(s)</div></div>` : ''}
+        ${routeTile(longest, 'Vol le plus long')}
+        ${routeTile(shortest, 'Vol le plus court')}
+      </div>
+    </div>`;
+}
+
 function renderFlightStats(content, flights) {
   const totalMin = flights.reduce((sum, f) => {
     if (!f.startTime || !f.endTime) return sum;
@@ -956,6 +1000,8 @@ function renderFlightStats(content, flights) {
       <div class="stat-tile"><div class="label">Vols</div><div class="value">${flights.length}</div></div>
       <div class="stat-tile"><div class="label">Temps de vol total</div><div class="value">${fmtTotalHours(totalMin)}</div></div>
     </div>
+
+    ${renderMilestones(flights)}
 
     <div class="chart-card">
       <h3>Retard moyen (arrivée) par compagnie</h3>

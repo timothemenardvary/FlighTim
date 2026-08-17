@@ -351,19 +351,20 @@ button.danger { color: var(--danger); }
   overflow: hidden;
   border: 1px solid var(--border);
   background: var(--bg-card);
-  aspect-ratio: 16 / 9;
+  max-height: 55vh;
 }
 .aircraft-photo img {
   width: 100%;
-  height: 100%;
-  object-fit: cover;
+  max-height: 55vh;
+  object-fit: contain;
   display: block;
+  margin: 0 auto;
 }
 .aircraft-photo-fallback {
   display: none;
   align-items: center;
   justify-content: center;
-  height: 100%;
+  aspect-ratio: 16 / 9;
   color: var(--text-dim);
   font-size: 13px;
   text-align: center;
@@ -471,6 +472,7 @@ button.danger { color: var(--danger); }
   border-radius: 12px;
   padding: 12px 14px;
 }
+a.stat-tile { display: block; text-decoration: none; color: inherit; }
 .stat-tile .label { font-size: 12px; color: var(--text-dim); }
 .stat-tile .value { font-size: 19px; font-weight: 700; margin-top: 2px; }
 .stat-tile .value.good { color: var(--accent-2); }

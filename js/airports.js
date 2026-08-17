@@ -97,3 +97,42 @@ export function lookupAirport(code) {
   if (!code) return null;
   return BY_CODE.get(String(code).trim().toUpperCase()) || null;
 }
+
+// Continent par pays, pour les jalons perso (Stats > Vols) — couvre
+// uniquement les pays présents dans RAW ci-dessus.
+const CONTINENT_BY_COUNTRY = {
+  'Allemagne': 'Europe',
+  'Argentine': 'Amérique du Sud',
+  'Bahreïn': 'Asie',
+  'Brésil': 'Amérique du Sud',
+  'Canada': 'Amérique du Nord',
+  'Chili': 'Amérique du Sud',
+  'Émirats arabes unis': 'Asie',
+  'Équateur': 'Amérique du Sud',
+  'Espagne': 'Europe',
+  'France': 'Europe',
+  'Grèce': 'Europe',
+  'Hong Kong': 'Asie',
+  'Inde': 'Asie',
+  'Italie': 'Europe',
+  'Maroc': 'Afrique',
+  'Norvège': 'Europe',
+  'Oman': 'Asie',
+  'Panama': 'Amérique du Nord',
+  'Pays-Bas': 'Europe',
+  'Portugal': 'Europe',
+  'Qatar': 'Asie',
+  'Royaume-Uni': 'Europe',
+  'Singapour': 'Asie',
+  'Slovénie': 'Europe',
+  'Suisse': 'Europe',
+  'Tchéquie': 'Europe',
+  'Thaïlande': 'Asie',
+  'USA': 'Amérique du Nord',
+  'Vietnam': 'Asie',
+};
+
+export function continentFor(country) {
+  if (!country) return null;
+  return CONTINENT_BY_COUNTRY[country] || null;
+}
