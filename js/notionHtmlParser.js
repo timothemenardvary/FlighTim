@@ -23,9 +23,9 @@ export function resolveRelativePath(baseRelPath, relPath) {
   return dir.join('/');
 }
 
-// Renvoie { key, notes, photoPaths } ou `null` si cette page n'est pas une
-// ligne "Flight History" exploitable (page vide, ligne Aircraft/Airports,
-// page sans date...).
+// Renvoie { key, notes, photoPaths, flightPlanPath } ou `null` si cette page
+// n'est pas une ligne "Flight History" exploitable (page vide, ligne
+// Aircraft/Airports, page sans date...).
 export function parseNotionFlightPage(html, filename) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const article = doc.querySelector('article.page');
@@ -51,10 +51,20 @@ export function parseNotionFlightPage(html, filename) {
     ? [...body.querySelectorAll('figure[data-notion-image] img')].map((img) => img.getAttribute('src')).filter(Boolean)
     : [];
 
+  // Propriété de type "Fichier" (ex. "FlightPlan") : rendue par Notion comme
+  // un lien vers le PDF/document joint, dans une cellule du tableau
+  // properties plutôt que dans le corps de la page — indépendant du libellé
+  // exact de la propriété pour rester robuste si elle est renommée.
+  const flightPlanLink = article.querySelector('tr.property-row-file a[href]');
+  const flightPlanPath = flightPlanLink?.getAttribute('href') || null;
+  const flightPlanName = flightPlanLink?.textContent?.trim() || null;
+
   return {
     key: `${flightNumber}|${date}`,
     notes: notes || null,
     photoPaths,
+    flightPlanPath,
+    flightPlanName,
     sourceFile: filename,
   };
 }

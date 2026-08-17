@@ -12,7 +12,7 @@ import { createFlightReplay } from './replay.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v19';
+const APP_VERSION = 'v21';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
@@ -51,7 +51,8 @@ let statsSubView = 'flights'; // page Stats : 'flights' ou 'airports'
 let statsYear = 'all'; // filtre année partagé par les deux sous-vues de la page Stats
 let selectedAirport = null; // aéroport choisi dans le détail de la page Stats > Aéroports
 let flightSearchQuery = ''; // texte de la barre de recherche, page Liste des vols
-let flightPhotoObjectUrl = null; // URL blob de la photo perso affichée sur le détail de vol, à révoquer au prochain rendu
+let flightPhotoObjectUrls = []; // URLs blob de la galerie photo perso affichée sur le détail de vol, à révoquer au prochain rendu
+let flightPlanObjectUrl = null; // URL blob du PDF plan de vol affiché sur le détail de vol, à révoquer au prochain rendu
 
 function notionKeyFor(flight) {
   return `${(flight.flightNumber || '').toUpperCase()}|${flight.date || ''}`;
@@ -537,9 +538,11 @@ function setupAltitudeChart(canvas, points) {
 }
 
 function renderFlightDetail(id) {
-  // Révoque l'URL blob de la photo perso du rendu précédent (page quittée
-  // ou vol différent) avant d'en créer éventuellement une nouvelle.
-  if (flightPhotoObjectUrl) { URL.revokeObjectURL(flightPhotoObjectUrl); flightPhotoObjectUrl = null; }
+  // Révoque les URLs blob de la galerie photo du rendu précédent (page
+  // quittée ou vol différent) avant d'en créer éventuellement de nouvelles.
+  flightPhotoObjectUrls.forEach((u) => URL.revokeObjectURL(u));
+  flightPhotoObjectUrls = [];
+  if (flightPlanObjectUrl) { URL.revokeObjectURL(flightPlanObjectUrl); flightPlanObjectUrl = null; }
 
   const f = buildDisplayFlights().find((x) => x.id === id);
   headerTitle.textContent = f ? f.flightNumber : 'Vol';
@@ -559,11 +562,15 @@ function renderFlightDetail(id) {
   const hasGateTimes = depGateActual != null || arrGateActual != null;
   const registration = f.registration || n?.registration || null;
 
-  // Photo perso jointe à ce vol dans Notion (prioritaire, souvenir du vol
-  // lui-même) plutôt que la photo générique de l'appareil via FlightAware.
-  const photo = n?.photoBlob
-    ? { kind: 'personal' }
-    : (f.photoUrl ? { kind: 'flightaware', url: f.photoUrl } : null);
+  // Photo(s) perso jointe(s) à ce vol dans Notion (prioritaire, souvenir du
+  // vol lui-même) plutôt que la photo générique de l'appareil via
+  // FlightAware — les deux sources ne se mélangent jamais dans la galerie.
+  const personalPhotoBlobs = n?.photoBlobs?.length ? n.photoBlobs : (n?.photoBlob ? [n.photoBlob] : []);
+  const photos = personalPhotoBlobs.length
+    ? personalPhotoBlobs.map((blob) => ({ kind: 'personal', blob }))
+    : (f.photoUrl ? [{ kind: 'flightaware', url: f.photoUrl }] : []);
+
+  const flightPlanBlob = n?.flightPlanBlob || null;
 
   const depDelayMin = delayMinutes(depGateSched, depGateActual);
   const arrDelayMin = delayMinutes(arrGateSched, arrGateActual);
@@ -673,11 +680,29 @@ function renderFlightDetail(id) {
       <div class="info-list">${arrRows}</div>
     </div>` : ''}
 
-    ${photo ? `
+    ${flightPlanBlob ? `
+    <div class="flightplan-card">
+      <button type="button" class="secondary" id="flightplan-toggle">&#128196; Plan de vol${n.flightPlanName ? ' · ' + escapeHtml(n.flightPlanName) : ''}</button>
+      <div class="flightplan-viewer" id="flightplan-viewer" hidden>
+        <iframe id="flightplan-frame" title="Plan de vol"></iframe>
+      </div>
+    </div>` : ''}
+
+    ${photos.length ? `
     <div class="aircraft-photo" id="aircraft-photo-wrap">
-      <img id="aircraft-photo-img" alt="${photo.kind === 'personal' ? 'Photo du vol' : "Photo de l'appareil"}" loading="lazy" />
-      <div class="aircraft-photo-fallback" id="aircraft-photo-fallback">Photo indisponible${photo.kind === 'flightaware' ? ' hors ligne' : ''}</div>
-      ${photo.kind === 'flightaware' ? '<span class="aircraft-photo-credit">Photo : FlightAware</span>' : ''}
+      <div class="aircraft-photo-track" id="aircraft-photo-track">
+        ${photos.map((p, i) => `
+        <div class="aircraft-photo-slide" data-idx="${i}">
+          <img data-idx="${i}" alt="${p.kind === 'personal' ? `Photo du vol${photos.length > 1 ? ' ' + (i + 1) + '/' + photos.length : ''}` : "Photo de l'appareil"}" loading="lazy" />
+          <div class="aircraft-photo-fallback">Photo indisponible${p.kind === 'flightaware' ? ' hors ligne' : ''}</div>
+        </div>`).join('')}
+      </div>
+      ${photos.length > 1 ? `
+      <span class="aircraft-photo-count" id="aircraft-photo-count">1/${photos.length}</span>
+      <div class="aircraft-photo-dots" id="aircraft-photo-dots">
+        ${photos.map((_, i) => `<button type="button" class="dot${i === 0 ? ' active' : ''}" data-idx="${i}" aria-label="Photo ${i + 1}"></button>`).join('')}
+      </div>` : ''}
+      ${photos[0].kind === 'flightaware' ? '<span class="aircraft-photo-credit">Photo : FlightAware</span>' : ''}
     </div>` : ''}
 
     <div class="stat-grid">
@@ -707,21 +732,66 @@ function renderFlightDetail(id) {
 
   document.getElementById('back-btn').addEventListener('click', () => navigate('#/flights'));
 
-  if (photo) {
-    const img = document.getElementById('aircraft-photo-img');
-    // Écouteur posé avant d'assigner src : si le chargement échoue (hors
-    // ligne, lien mort, format non supporté par le navigateur...) on
-    // bascule sur le texte de repli plutôt que de laisser une icône
-    // d'image cassée.
-    img.addEventListener('error', () => {
-      document.getElementById('aircraft-photo-wrap')?.classList.add('is-fallback');
+  if (flightPlanBlob) {
+    const toggleBtn = document.getElementById('flightplan-toggle');
+    const viewer = document.getElementById('flightplan-viewer');
+    const frame = document.getElementById('flightplan-frame');
+    const label = `Plan de vol${n.flightPlanName ? ' · ' + escapeHtml(n.flightPlanName) : ''}`;
+    toggleBtn.addEventListener('click', () => {
+      const opening = viewer.hidden;
+      viewer.hidden = !opening;
+      toggleBtn.innerHTML = opening ? '&#128196; Masquer le plan de vol' : `&#128196; ${label}`;
+      // Le blob PDF n'est chargé dans l'iframe qu'à la première ouverture,
+      // pas au rendu de la page : pas de coût pour les vols qu'on ne consulte
+      // jamais.
+      if (opening && !frame.src) {
+        flightPlanObjectUrl = URL.createObjectURL(flightPlanBlob);
+        frame.src = flightPlanObjectUrl;
+      }
     });
-    if (photo.kind === 'personal') {
-      flightPhotoObjectUrl = URL.createObjectURL(n.photoBlob);
-      img.src = flightPhotoObjectUrl;
-    } else {
-      img.src = photo.url;
-    }
+  }
+
+  if (photos.length) {
+    const track = document.getElementById('aircraft-photo-track');
+    track.querySelectorAll('img').forEach((img) => {
+      const p = photos[Number(img.dataset.idx)];
+      // Écouteur posé avant d'assigner src : si le chargement échoue (hors
+      // ligne, lien mort, format non supporté par le navigateur...) on
+      // bascule sur le texte de repli pour cette photo, sans affecter les
+      // autres photos de la galerie.
+      img.addEventListener('error', () => {
+        img.closest('.aircraft-photo-slide')?.classList.add('is-fallback');
+      });
+      if (p.kind === 'personal') {
+        const url = URL.createObjectURL(p.blob);
+        flightPhotoObjectUrls.push(url);
+        img.src = url;
+      } else {
+        img.src = p.url;
+      }
+    });
+  }
+
+  if (photos.length > 1) {
+    const track = document.getElementById('aircraft-photo-track');
+    const dots = [...document.getElementById('aircraft-photo-dots').querySelectorAll('.dot')];
+    const countEl = document.getElementById('aircraft-photo-count');
+    const setActive = (idx) => {
+      dots.forEach((d, i) => d.classList.toggle('active', i === idx));
+      countEl.textContent = `${idx + 1}/${photos.length}`;
+    };
+    dots.forEach((dot) => {
+      dot.addEventListener('click', () => {
+        track.scrollTo({ left: Number(dot.dataset.idx) * track.clientWidth, behavior: 'smooth' });
+      });
+    });
+    let scrollTimeout;
+    track.addEventListener('scroll', () => {
+      clearTimeout(scrollTimeout);
+      scrollTimeout = setTimeout(() => {
+        setActive(Math.round(track.scrollLeft / track.clientWidth));
+      }, 60);
+    });
   }
 
   if (hasRealTrack) {
@@ -1499,7 +1569,7 @@ async function handleFileSelection(allFiles) {
   // même export.
   const filesByRelPath = new Map(allFiles.map((f) => [f.webkitRelativePath || f.name, f]));
   const touchedKeys = new Set();
-  let notesFound = 0, photosFound = 0;
+  let notesFound = 0, photosFound = 0, flightPlansFound = 0;
 
   for (const file of notionPageFiles) {
     try {
@@ -1512,10 +1582,19 @@ async function handleFileSelection(allFiles) {
       if (parsed.notes) { record.notes = parsed.notes; notesFound++; }
       if (parsed.photoPaths.length) {
         const basePath = file.webkitRelativePath || file.name;
-        const photoFile = parsed.photoPaths
+        const photoFiles = parsed.photoPaths
           .map((relPath) => filesByRelPath.get(resolveRelativePath(basePath, relPath)))
-          .find(Boolean);
-        if (photoFile) { record.photoBlob = photoFile; photosFound++; }
+          .filter(Boolean);
+        if (photoFiles.length) { record.photoBlobs = photoFiles; delete record.photoBlob; photosFound++; }
+      }
+      if (parsed.flightPlanPath) {
+        const basePath = file.webkitRelativePath || file.name;
+        const flightPlanFile = filesByRelPath.get(resolveRelativePath(basePath, parsed.flightPlanPath));
+        if (flightPlanFile) {
+          record.flightPlanBlob = flightPlanFile;
+          record.flightPlanName = parsed.flightPlanName || flightPlanFile.name;
+          flightPlansFound++;
+        }
       }
       touchedKeys.add(parsed.key);
     } catch (err) {
@@ -1539,8 +1618,8 @@ async function handleFileSelection(allFiles) {
   if (csvFiles.length) {
     summary.push(`${allRecords.length} ligne(s) Notion${csvIgnored ? ' · ' + csvIgnored + ' fichier(s) ignoré(s)' : ''}${csvErrors ? ' · ' + csvErrors + ' erreur(s)' : ''}`);
   }
-  if (notesFound || photosFound) {
-    summary.push(`${notesFound} note(s) · ${photosFound} photo(s)`);
+  if (notesFound || photosFound || flightPlansFound) {
+    summary.push(`${notesFound} note(s) · ${photosFound} photo(s) · ${flightPlansFound} plan(s) de vol`);
   }
   showToast(summary.join(' — '));
   render();
