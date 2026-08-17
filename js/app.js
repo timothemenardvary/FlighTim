@@ -12,13 +12,34 @@ import { createFlightReplay } from './replay.js';
 // la dernière version (utile sur iOS où le service worker peut mettre du
 // temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
 // dans sw.js, les deux ne sont pas lus depuis une source commune.
-const APP_VERSION = 'v17';
+const APP_VERSION = 'v19';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
-const folderInput = document.getElementById('folder-input');
-const filesInput = document.getElementById('files-input');
 const tabButtons = [...document.querySelectorAll('.tab')];
+
+// Ouvre le picker fichiers/dossier natif. Sur iOS Safari, réutiliser le même
+// <input type="file"> pour plusieurs sélections successives le fait parfois
+// se bloquer silencieusement (le .click() suivant ne rouvre plus rien) —
+// on recrée donc un input jetable à chaque appel plutôt qu'un input statique
+// dans index.html.
+function pickFiles({ directory = false } = {}) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.accept = '.kml,.json,.csv,.html,.htm';
+  if (directory) input.webkitdirectory = true;
+  // Hors écran plutôt que display:none (hidden) : certaines versions de
+  // WebKit ignorent le .click() programmatique d'un input non affiché.
+  Object.assign(input.style, { position: 'fixed', top: '-9999px', left: '-9999px' });
+  document.body.appendChild(input);
+  input.addEventListener('change', () => {
+    const files = [...input.files];
+    input.remove();
+    handleFileSelection(files);
+  }, { once: true });
+  input.click();
+}
 
 let flights = []; // in-memory cache of vols KML, triés desc par date
 let notionByKey = new Map(); // "NUMEROVOL|YYYY-MM-DD" -> ligne Notion, pour enrichir le détail d'un vol
@@ -423,7 +444,7 @@ function renderFlightsList() {
         <div>Aucun vol importé pour l'instant.</div>
         <button class="primary" id="import-empty-btn">Importer mes données</button>
       </div>`;
-    document.getElementById('import-empty-btn').addEventListener('click', () => folderInput.click());
+    document.getElementById('import-empty-btn').addEventListener('click', () => pickFiles({ directory: true }));
     return;
   }
 
@@ -1277,10 +1298,10 @@ async function renderSettings() {
           "Rafraîchir" vide d'abord toutes les données locales puis réimporte depuis le dossier que tu
           choisis ensuite — utile si des fichiers source ont été modifiés ou supprimés depuis le dernier
           import (un import normal ignore les fichiers inchangés et ne détecte pas les suppressions).
-          Si "Choisir le dossier" ne répond pas (bug connu de Safari iOS avec les dossiers iCloud Drive :
-          l'écran de sélection se ferme sans rien importer quand on touche "Ouvrir"), utilise "Choisir des
-          fichiers" : sélectionne tous les fichiers du dossier à la main (⌘A / tout sélectionner dans
-          l'app Fichiers) plutôt que le dossier lui-même.
+          Sur iOS, il arrive qu'un bouton ne réponde pas du tout au premier essai (bug connu de Safari
+          avec les sélecteurs de fichiers) — réessaie une seconde fois, ou utilise l'autre bouton. "Choisir
+          des fichiers" demande de sélectionner tous les fichiers du dossier à la main (⌘A / tout
+          sélectionner dans l'app Fichiers) plutôt que le dossier lui-même.
         </p>
       </div>
     </div>
@@ -1302,23 +1323,40 @@ async function renderSettings() {
           directement dans votre navigateur — aucune donnée n'est envoyée à un serveur. Les fichiers sont
           lus localement, puis stockés sur cet appareil pour un accès hors-ligne.
         </p>
+        <div class="settings-actions" style="margin-top:12px;">
+          <button class="secondary" id="reload-app-btn">Recharger l'app</button>
+        </div>
         <p style="margin:10px 0 0; font-size:12px; color:var(--text-dim);">Version ${escapeHtml(APP_VERSION)}</p>
       </div>
     </div>
   `;
 
+  document.getElementById('reload-app-btn').addEventListener('click', async () => {
+    // Utile en mode standalone (icône écran d'accueil) : pas de barre d'adresse
+    // ni de bouton "recharger" natif si l'app se fige. On relance aussi une
+    // vérification de mise à jour du service worker au passage, pour ne pas
+    // rester bloqué sur une version mise en cache si une plus récente a été
+    // déployée entre-temps.
+    try {
+      const reg = await navigator.serviceWorker?.getRegistration();
+      await reg?.update();
+    } catch (err) {
+      console.warn('SW update check failed', err);
+    }
+    location.reload();
+  });
   document.getElementById('pick-folder-btn').addEventListener('click', () => {
     pendingRefresh = false;
-    folderInput.click();
+    pickFiles({ directory: true });
   });
   document.getElementById('pick-files-btn').addEventListener('click', () => {
     pendingRefresh = false;
-    filesInput.click();
+    pickFiles({ directory: false });
   });
   document.getElementById('refresh-btn').addEventListener('click', () => {
     if (!confirm('Effacer toutes les données locales puis tout réimporter depuis le dossier que tu vas choisir ?')) return;
     pendingRefresh = true;
-    folderInput.click();
+    pickFiles({ directory: true });
   });
   document.getElementById('clear-btn').addEventListener('click', async () => {
     if (!confirm('Supprimer tous les vols et données Notion importés sur cet appareil ?')) return;
@@ -1507,17 +1545,6 @@ async function handleFileSelection(allFiles) {
   showToast(summary.join(' — '));
   render();
 }
-
-folderInput.addEventListener('change', () => {
-  const allFiles = [...folderInput.files];
-  folderInput.value = '';
-  handleFileSelection(allFiles);
-});
-filesInput.addEventListener('change', () => {
-  const allFiles = [...filesInput.files];
-  filesInput.value = '';
-  handleFileSelection(allFiles);
-});
 
 // ---------- Init ----------
 
