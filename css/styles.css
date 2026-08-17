@@ -762,4 +762,75 @@ select {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---------- Atlas de vol (Stats > Monde) ---------- */
+.worldmap-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 4px 4px 0;
+  margin: 14px 0;
+  overflow: hidden;
+}
+.worldmap-readout {
+  padding: 10px 12px 2px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.worldmap-readout .empty { color: var(--text-dim); font-weight: 500; font-size: 12px; }
+#wm-svg { display: block; width: 100%; height: auto; }
+.wm-land {
+  fill: var(--border);
+  stroke: var(--bg-card);
+  stroke-width: 0.6;
+}
+.wm-visited {
+  fill: var(--accent);
+  stroke: var(--bg-card);
+  stroke-width: 0.6;
+  cursor: pointer;
+  transition: fill 0.15s ease;
+}
+.wm-visited:hover, .wm-visited:focus-visible { fill: var(--accent-2); outline: none; }
+.wm-pin circle {
+  fill: var(--accent);
+  stroke: var(--bg-card);
+  stroke-width: 1.4;
+  cursor: pointer;
+}
+.wm-pin:hover circle, .wm-pin:focus-visible circle { fill: var(--accent-2); outline: none; }
+.worldmap-legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 8px 12px 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.worldmap-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.worldmap-legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.worldmap-legend i.visited-sw { background: var(--accent); }
+.worldmap-legend i.land-sw { background: var(--border); }
+.worldmap-legend i.pin-sw { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+
+.worldmap-index {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px 24px;
+  margin: 18px 0;
+}
+.wm-cont h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.wm-cont .count { color: var(--text-dim); font-weight: 500; }
+.wm-cont ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.wm-cont li { font-size: 14px; display: flex; align-items: center; gap: 7px; }
+.wm-cont li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+
 .leaflet-control-attribution { font-size: 9px; }

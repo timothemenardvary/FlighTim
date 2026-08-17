@@ -136,3 +136,15 @@ export function continentFor(country) {
   if (!country) return null;
   return CONTINENT_BY_COUNTRY[country] || null;
 }
+
+// Coordonnées moyennes des aéroports d'un pays — utilisé par l'Atlas de vol
+// (Stats > Monde) pour placer une pastille sur les pays trop petits pour
+// avoir un tracé exploitable dans le fond de carte basse résolution
+// (micro-États : Bahreïn, Hong Kong, Singapour...).
+export function averageCoordFor(country) {
+  const matches = RAW.filter(([, , , c]) => c === country);
+  if (!matches.length) return null;
+  const lat = matches.reduce((sum, [, , , , , lat]) => sum + lat, 0) / matches.length;
+  const lon = matches.reduce((sum, [, , , , , , lon]) => sum + lon, 0) / matches.length;
+  return [lat, lon];
+}

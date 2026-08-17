@@ -4,12 +4,20 @@ import { parseNotionCSV } from './notionParser.js';
 import { parseNotionFlightPage, resolveRelativePath } from './notionHtmlParser.js';
 import * as db from './db.js';
 import { createMap, drawFlightPath, drawGreatCircle, fitToLayers, endpointDot, createPlaneMarker } from './mapView.js';
-import { lookupAirport, continentFor } from './airports.js';
+import { lookupAirport, continentFor, averageCoordFor } from './airports.js';
+import { WORLD_VIEWBOX, WORLD_LAND_SVG, VISITED_COUNTRY_PATHS, projectLonLat } from './worldGeo.js';
 import { createFlightReplay } from './replay.js';
+
+// Affichée en bas de Réglages pour vérifier qu'un appareil a bien rechargé
+// la dernière version (utile sur iOS où le service worker peut mettre du
+// temps à se mettre à jour) — à faire évoluer en même temps que CACHE_NAME
+// dans sw.js, les deux ne sont pas lus depuis une source commune.
+const APP_VERSION = 'v17';
 
 const viewRoot = document.getElementById('view-root');
 const headerTitle = document.getElementById('header-title');
 const folderInput = document.getElementById('folder-input');
+const filesInput = document.getElementById('files-input');
 const tabButtons = [...document.querySelectorAll('.tab')];
 
 let flights = []; // in-memory cache of vols KML, triés desc par date
@@ -906,6 +914,7 @@ function renderStats() {
       <div class="segmented" id="stats-tabs">
         <button type="button" data-view="flights" class="${statsSubView === 'flights' ? 'active' : ''}">Vols</button>
         <button type="button" data-view="airports" class="${statsSubView === 'airports' ? 'active' : ''}">Aéroports</button>
+        <button type="button" data-view="world" class="${statsSubView === 'world' ? 'active' : ''}">Monde</button>
       </div>
       <select id="stats-year">
         <option value="all" ${statsYear === 'all' ? 'selected' : ''}>Toutes les années</option>
@@ -933,24 +942,33 @@ function renderStats() {
     return;
   }
   if (statsSubView === 'airports') renderAirportStats(content, flights);
+  else if (statsSubView === 'world') renderWorldStats(content, flights);
   else renderFlightStats(content, flights);
+}
+
+// Pays/continents effectivement traversés par cette sélection de vols
+// (départ ou arrivée), regroupés par continent — base commune à la tuile
+// "Repères" et à l'Atlas de vol (Stats > Monde).
+function visitedGeo(flights) {
+  const byContinent = new Map(); // continent -> Set<pays>
+  for (const f of flights) {
+    for (const iata of [f.depIata, f.arrIata]) {
+      const country = resolveAirport(iata)?.country;
+      if (!country) continue;
+      const continent = continentFor(country) || 'Autre';
+      if (!byContinent.has(continent)) byContinent.set(continent, new Set());
+      byContinent.get(continent).add(country);
+    }
+  }
+  const countries = new Set([...byContinent.values()].flatMap((s) => [...s]));
+  return { countries, continents: new Set(byContinent.keys()), byContinent };
 }
 
 // Jalons perso (pays/continents visités, appareil favori, vol le plus
 // long/court) : tout est déjà dérivable des vols affichés + du référentiel
 // aéroports, aucune donnée supplémentaire à importer.
 function renderMilestones(flights) {
-  const countries = new Set();
-  const continents = new Set();
-  for (const f of flights) {
-    for (const iata of [f.depIata, f.arrIata]) {
-      const country = resolveAirport(iata)?.country;
-      if (!country) continue;
-      countries.add(country);
-      const continent = continentFor(country);
-      if (continent) continents.add(continent);
-    }
-  }
+  const { countries, continents } = visitedGeo(flights);
 
   const [topAircraftType, topAircraftCount] = countBy(flights, (f) => f.aircraftType, { includeUnknown: false })[0] || [];
 
@@ -1116,6 +1134,79 @@ function renderAirportDetail(el, { dep, arr }, code) {
   wireBarChartToggles(el);
 }
 
+const CONTINENT_ORDER = ['Europe', 'Amérique du Nord', 'Amérique du Sud', 'Asie', 'Afrique', 'Océanie', 'Autre'];
+
+// Atlas de vol : carte du monde avec les pays traversés (départ/arrivée) par
+// la sélection de vols en cours, en surbrillance. Fond de carte + tracés
+// embarqués (worldGeo.js, dérivés de Natural Earth) pour rester hors-ligne.
+// Les pays visités trop petits pour un tracé à cette résolution (micro-États)
+// sont affichés en pastille, positionnée via les coordonnées de leurs
+// aéroports (airports.js).
+function renderWorldStats(content, flights) {
+  const { countries, continents, byContinent } = visitedGeo(flights);
+
+  const shapes = [];
+  for (const country of countries) {
+    const path = VISITED_COUNTRY_PATHS[country];
+    if (path) {
+      shapes.push(`<path class="wm-visited" data-name="${escapeHtml(country)}" tabindex="0" d="${path}"/>`);
+      continue;
+    }
+    const coord = averageCoordFor(country);
+    if (!coord) continue;
+    const [x, y] = projectLonLat(coord[1], coord[0]);
+    shapes.push(`<g class="wm-pin" data-name="${escapeHtml(country)}" tabindex="0" transform="translate(${x.toFixed(1)},${y.toFixed(1)})"><circle r="4"/></g>`);
+  }
+
+  const indexHtml = CONTINENT_ORDER
+    .filter((c) => byContinent.has(c))
+    .map((continent) => {
+      const list = [...byContinent.get(continent)].sort((a, b) => a.localeCompare(b, 'fr'));
+      return `
+        <div class="wm-cont">
+          <h3>${escapeHtml(continent)}<span class="count">${list.length}</span></h3>
+          <ul>${list.map((c) => `<li>${escapeHtml(c)}</li>`).join('')}</ul>
+        </div>`;
+    }).join('');
+
+  content.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="label">Pays visités</div><div class="value">${countries.size}</div></div>
+      <div class="stat-tile"><div class="label">Continents</div><div class="value">${continents.size}</div></div>
+    </div>
+
+    <div class="worldmap-card">
+      <div class="worldmap-readout">
+        <span class="name empty" id="wm-readout">Survolez un pays</span>
+      </div>
+      <svg id="wm-svg" viewBox="${WORLD_VIEWBOX}" role="img" aria-label="Carte du monde avec les pays visités en surbrillance">
+        <g class="wm-lands">${WORLD_LAND_SVG}</g>
+        <g class="wm-visited-layer">${shapes.join('')}</g>
+      </svg>
+      <div class="worldmap-legend">
+        <span><i class="visited-sw"></i>Pays visité</span>
+        <span><i class="land-sw"></i>Non visité</span>
+        <span><i class="pin-sw"></i>Micro-État (hors échelle)</span>
+      </div>
+    </div>
+
+    <div class="worldmap-index">${indexHtml}</div>
+  `;
+
+  const readout = document.getElementById('wm-readout');
+  const setReadout = (name) => {
+    if (name) { readout.textContent = name; readout.classList.remove('empty'); }
+    else { readout.textContent = 'Survolez un pays'; readout.classList.add('empty'); }
+  };
+  content.querySelectorAll('.wm-visited, .wm-pin').forEach((el) => {
+    const name = el.getAttribute('data-name');
+    el.addEventListener('pointerenter', () => setReadout(name));
+    el.addEventListener('pointerleave', () => setReadout(null));
+    el.addEventListener('focus', () => setReadout(name));
+    el.addEventListener('blur', () => setReadout(null));
+  });
+}
+
 // Fiche avion : accessible depuis une immatriculation cliquée n'importe où
 // dans l'app (détail de vol, stats). Regroupe tous les vols enregistrés pour
 // cette immatriculation, toutes sources confondues (KML/JSON + Notion).
@@ -1173,6 +1264,7 @@ async function renderSettings() {
         <div class="settings-row"><span class="k">Vols enrichis (Notion)</span><span>${notionByKey.size}</span></div>
         <div class="settings-actions">
           <button class="primary" id="pick-folder-btn">Choisir le dossier</button>
+          <button class="secondary" id="pick-files-btn">Choisir des fichiers</button>
           <button class="secondary" id="refresh-btn">Rafraîchir (efface et réimporte tout)</button>
         </div>
         <p style="margin:10px 0 0; font-size:12px; color:var(--text-dim); line-height:1.4;">
@@ -1185,6 +1277,10 @@ async function renderSettings() {
           "Rafraîchir" vide d'abord toutes les données locales puis réimporte depuis le dossier que tu
           choisis ensuite — utile si des fichiers source ont été modifiés ou supprimés depuis le dernier
           import (un import normal ignore les fichiers inchangés et ne détecte pas les suppressions).
+          Si "Choisir le dossier" ne répond pas (bug connu de Safari iOS avec les dossiers iCloud Drive :
+          l'écran de sélection se ferme sans rien importer quand on touche "Ouvrir"), utilise "Choisir des
+          fichiers" : sélectionne tous les fichiers du dossier à la main (⌘A / tout sélectionner dans
+          l'app Fichiers) plutôt que le dossier lui-même.
         </p>
       </div>
     </div>
@@ -1206,6 +1302,7 @@ async function renderSettings() {
           directement dans votre navigateur — aucune donnée n'est envoyée à un serveur. Les fichiers sont
           lus localement, puis stockés sur cet appareil pour un accès hors-ligne.
         </p>
+        <p style="margin:10px 0 0; font-size:12px; color:var(--text-dim);">Version ${escapeHtml(APP_VERSION)}</p>
       </div>
     </div>
   `;
@@ -1213,6 +1310,10 @@ async function renderSettings() {
   document.getElementById('pick-folder-btn').addEventListener('click', () => {
     pendingRefresh = false;
     folderInput.click();
+  });
+  document.getElementById('pick-files-btn').addEventListener('click', () => {
+    pendingRefresh = false;
+    filesInput.click();
   });
   document.getElementById('refresh-btn').addEventListener('click', () => {
     if (!confirm('Effacer toutes les données locales puis tout réimporter depuis le dossier que tu vas choisir ?')) return;
@@ -1235,9 +1336,11 @@ async function renderSettings() {
 
 // ---------- Import ----------
 
-folderInput.addEventListener('change', async () => {
-  const allFiles = [...folderInput.files];
-  folderInput.value = '';
+// Partagé par les deux sélecteurs (dossier via webkitdirectory, ou fichiers
+// à plat) : sur iOS Safari, le picker "dossier" ne répond parfois pas du
+// tout (bug connu avec les dossiers iCloud Drive, l'event change ne part
+// jamais) — #files-input sert alors de repli fiable, cf Réglages.
+async function handleFileSelection(allFiles) {
   const isRefresh = pendingRefresh;
   pendingRefresh = false;
 
@@ -1403,6 +1506,17 @@ folderInput.addEventListener('change', async () => {
   }
   showToast(summary.join(' — '));
   render();
+}
+
+folderInput.addEventListener('change', () => {
+  const allFiles = [...folderInput.files];
+  folderInput.value = '';
+  handleFileSelection(allFiles);
+});
+filesInput.addEventListener('change', () => {
+  const allFiles = [...filesInput.files];
+  filesInput.value = '';
+  handleFileSelection(allFiles);
 });
 
 // ---------- Init ----------
